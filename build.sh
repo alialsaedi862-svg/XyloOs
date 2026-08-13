@@ -75,7 +75,7 @@ sed -i \
   -e "s/^iso_name=.*/iso_name=\"${ISO_NAME}\"/" \
   -e "s/^iso_label=.*/iso_label=\"${ISO_LABEL}\"/" \
   -e "s/^iso_publisher=.*/iso_publisher=\"${ISO_PUBLISHER}\"/" \
-  -e "s/^iso_application=.*/iso_application=\"${ISO_APPLICATION}\"/" \
+  -e "s#^iso_application=.*#iso_application=\"${ISO_APPLICATION}\"#" \
   -e "s#^install_dir=.*#install_dir=\"${INSTALL_DIR}\"#" \
   "${PROFILE_DIR}/profiledef.sh"
 
