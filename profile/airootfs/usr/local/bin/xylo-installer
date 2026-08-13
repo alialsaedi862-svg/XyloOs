@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+#
+# xylo-installer — xyloOS interactive installation wizard (Arch Linux base)
+#
+# Mirrors the feature set and fixes of the Ubuntu-based xyloos-install:
+#   - Wi-Fi via iwctl with an arrow-key dialog menu, real DHCP (dhcpcd)
+#   - Disk selection with a y/n confirm and automatic boot-medium exclusion
+#   - User account creation with sudo
+#   - Timezone selection
+#   - 17-option DE/WM picker via dialog (black theme)
+#   - pacstrap + arch-chroot install, with GRUB installed for both the
+#     registered NVRAM entry and the removable/fallback path
+#   - A safety net in the launching .bash_profile so no failure silently
+#     dumps you at an unexplained shell (see build.sh)
+#
+# NOTE ON PACKAGE NAMES: these were written from best available knowledge
+# of Arch's official repos, not verified against a live pacman database (no
+# Arch mirror access in the environment that authored this). Every DE/WM
+# selection below runs a `pacman -Si` availability check against your
+# actual mirrors before installing anything, and tells you plainly if a
+# package name needs correcting rather than failing silently mid-install.
+#
+set -uo pipefail
+
+BOLD=$'\033[1m'; RESET=$'\033[0m'
+CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; YELLOW=$'\033[1;33m'
+banner() { echo; printf '%s=== %s ===%s\n' "$BOLD$CYAN" "$*" "$RESET"; }
+info()  { printf '%s[*]%s %s\n'  "$CYAN"   "$RESET" "$*"; }
+ok()    { printf '%s[OK]%s %s\n' "$GREEN"  "$RESET" "$*"; }
+warn()  { printf '%s[!]%s %s\n'  "$YELLOW" "$RESET" "$*"; }
+err()   { printf '%s[ERROR]%s %s\n' "$RED" "$RESET" "$*"; }
+die()   { err "$*"; exit 1; }
+strip_ansi() { sed -r 's/\x1b\[[0-9;]*[a-zA-Z]//g'; }
+
+require_root() { [[ $EUID -eq 0 ]] || die "Run as root."; }
+
+trap 'echo; err "Interrupted."; exit 130' INT TERM
+
+[[ -f /etc/xyloos/dialogrc ]] && export DIALOGRC=/etc/xyloos/dialogrc
+
+TARGET_DISK=""
+XYLO_USER=""
+XYLO_PASS=""
+TIMEZONE="UTC"
+DE_PKGS=""
+DE_SERVICE=""
+DE_LABEL="Minimal CLI Only"
+DE_MODE="none"
+WM_EXEC=""
+
+# ---------------------------------------------------------------------
+# Step 1: Wi-Fi
+# ---------------------------------------------------------------------
+step_wifi() {
+    banner "STEP 1: Network Connectivity"
+    if ping -c1 -W2 archlinux.org &>/dev/null; then
+        ok "Already online (wired connection or previously connected)."
+        return 0
+    fi
+
+    # Try wired first — a plugged-in cable shouldn't force you through Wi-Fi.
+    local ethdev
+    ethdev=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^(en|eth)' | head -1)
+    if [[ -n "$ethdev" ]]; then
+        info "Trying DHCP on $ethdev..."
+        ip link set "$ethdev" up 2>/dev/null
+        timeout 10 dhcpcd -1 "$ethdev" &>/dev/null || timeout 10 dhclient -1 "$ethdev" &>/dev/null
+        if ping -c1 -W2 archlinux.org &>/dev/null; then
+            ok "Connected via $ethdev."
+            return 0
+        fi
+    fi
+
+    if ! command -v iwctl &>/dev/null; then
+        warn "iwd/iwctl not available. Connect a wired cable and press Enter,"
+        warn "or open a second console (Ctrl+Alt+F2) and connect manually."
+        read -rp "Press Enter once you have a network connection: " _
+        if ping -c1 -W2 archlinux.org &>/dev/null; then
+            return 0
+        fi
+        warn "Still no internet access."
+        return 1
+    fi
+
+    # iwctl's "device list" table is: Name  Address  Powered  Adapter  Mode
+    # — interface name is field 1, NOT field 2 (that's the MAC address).
+    local dev
+    dev=$(iwctl device list 2>/dev/null | strip_ansi | awk '/station/{print $1; exit}')
+    [[ -z "$dev" ]] && dev=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
+    if [[ -z "$dev" ]]; then
+        warn "No wireless interface auto-detected."
+        read -rp "Enter your wireless device name manually (e.g. wlan0), or leave blank to skip Wi-Fi: " dev
+        [[ -z "$dev" ]] && { warn "Skipping Wi-Fi. Ensure you have another connection."; return 1; }
+    fi
+    info "Using wireless device: $dev"
+
+    while true; do
+        info "Scanning for networks..."
+        iwctl station "$dev" scan &>/dev/null
+        sleep 4
+
+        local uniq_list
+        collect_ssids() {
+            uniq_list=()
+            local seen="" line ssid
+            while IFS= read -r line; do
+                line=$(printf '%s' "$line" | strip_ansi)
+                ssid=$(printf '%s' "$line" | sed -E 's/^\s*[>*]?\s*//; s/\s{2,}.*$//')
+                [[ -z "$ssid" || "$ssid" == "Network"* ]] && continue
+                [[ "$seen" == *"|${ssid}|"* ]] && continue
+                seen="${seen}|${ssid}|"
+                uniq_list+=("$ssid")
+            done < <(iwctl station "$dev" get-networks 2>/dev/null | tail -n +5)
+        }
+        collect_ssids
+        if [[ ${#uniq_list[@]} -eq 0 ]]; then
+            info "No networks found yet, scanning again..."
+            iwctl station "$dev" scan &>/dev/null
+            sleep 5
+            collect_ssids
+        fi
+
+        local ssid=""
+        if [[ ${#uniq_list[@]} -gt 0 ]] && command -v dialog &>/dev/null; then
+            local menu_items=()
+            for s in "${uniq_list[@]}"; do
+                menu_items+=("$s" "")
+            done
+            menu_items+=("(Enter SSID manually)" "")
+            ssid=$(dialog --clear --backtitle "xyloOS Installer" \
+                --title "Select Wi-Fi Network" \
+                --menu "Use Up/Down arrows and Enter to select:" 20 60 12 \
+                "${menu_items[@]}" 3>&1 1>&2 2>&3)
+            clear
+            [[ "$ssid" == "(Enter SSID manually)" ]] && ssid=""
+        fi
+
+        if [[ -z "$ssid" && ${#uniq_list[@]} -eq 0 ]]; then
+            warn "Could not find any networks automatically."
+        fi
+        if [[ -z "$ssid" ]]; then
+            read -rp "Enter the SSID to connect to manually (blank to cancel): " ssid
+        fi
+        if [[ -z "$ssid" ]]; then
+            warn "No network selected."
+            read -rp "Try again? [Y/n] " r
+            if [[ ${r:-Y} =~ ^[Yy] ]]; then continue; else return 1; fi
+        fi
+
+        local pass
+        if command -v dialog &>/dev/null; then
+            pass=$(dialog --clear --backtitle "xyloOS Installer" \
+                --title "Wi-Fi Password" \
+                --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60 \
+                3>&1 1>&2 2>&3)
+            clear
+        else
+            read -rsp "Password for '$ssid' (blank = open network): " pass; echo
+        fi
+
+        info "Connecting to $ssid ..."
+        if [[ -n "$pass" ]]; then
+            iwctl --passphrase "$pass" station "$dev" connect "$ssid"
+        else
+            iwctl station "$dev" connect "$ssid"
+        fi
+
+        local linked=""
+        for _ in 1 2 3 4 5 6; do
+            if iwctl station "$dev" show 2>/dev/null | grep -qi "State.*connected"; then
+                linked=1
+                break
+            fi
+            sleep 1
+        done
+        if [[ -z "$linked" ]]; then
+            err "Could not associate with '$ssid' — double-check the password."
+            read -rp "Try again? [Y/n] " r
+            if [[ ${r:-Y} =~ ^[Yy] ]]; then continue; else return 1; fi
+        fi
+
+        # iwd only brings up the wireless link; it does not request an IP.
+        info "Requesting an IP address..."
+        if command -v dhcpcd &>/dev/null; then
+            timeout 15 dhcpcd -1 "$dev" &>/dev/null
+        elif command -v dhclient &>/dev/null; then
+            timeout 15 dhclient -1 "$dev" &>/dev/null
+        else
+            warn "No DHCP client found — cannot request an IP address automatically."
+        fi
+
+        sleep 1
+        if ping -c1 -W3 archlinux.org &>/dev/null; then
+            ok "Connected to the internet."
+            return 0
+        else
+            err "Linked to '$ssid' but couldn't reach the internet (no IP address or no route)."
+            read -rp "Try a different network? [Y/n] " r
+            if [[ ${r:-Y} =~ ^[Yy] ]]; then continue; else return 1; fi
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------
+# Step 2: Target drive
+# ---------------------------------------------------------------------
+step_disk() {
+    banner "STEP 2: Target Installation Drive"
+    echo
+
+    # Never let the boot medium itself show up as an install target.
+    # archiso mounts the live medium at /run/archiso/bootmnt.
+    local boot_part boot_disk
+    boot_part=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null)
+    if [[ -n "$boot_part" ]]; then
+        boot_disk=$(lsblk -no PKNAME "$boot_part" 2>/dev/null)
+    fi
+
+    declare -gA disk_map=()
+    local i=1 d size model
+    mapfile -t disks < <(lsblk -dn -e7,11 -o NAME,TYPE,SIZE | awk '$2=="disk" && $3!="0B"{print $1}')
+    [[ ${#disks[@]} -gt 0 ]] || die "No storage drives detected."
+
+    printf '%s%-4s %-14s %-10s %s%s\n' "$BOLD" "#" "DEVICE" "SIZE" "MODEL" "$RESET"
+    for d in "${disks[@]}"; do
+        if [[ -n "$boot_disk" && "$d" == "$boot_disk" ]]; then
+            continue
+        fi
+        size=$(lsblk -dn -o SIZE "/dev/$d")
+        model=$(lsblk -dn -o MODEL "/dev/$d" 2>/dev/null)
+        printf '%-4s %-14s %-10s %s\n' "$i" "/dev/$d" "$size" "$model"
+        disk_map[$i]="/dev/$d"
+        ((i++))
+    done
+    if [[ -n "$boot_disk" ]]; then
+        info "(/dev/$boot_disk — your xyloOS boot drive — is hidden from this list for safety)"
+    fi
+    [[ ${#disk_map[@]} -gt 0 ]] || die "No installable drives found (only the boot USB was detected)."
+
+    echo
+    local choice
+    read -rp "Select target drive number: " choice
+    TARGET_DISK="${disk_map[$choice]:-}"
+    [[ -n "$TARGET_DISK" ]] || die "Invalid selection."
+
+    echo
+    warn "ALL DATA ON $TARGET_DISK WILL BE PERMANENTLY ERASED."
+    read -rp "Erase $TARGET_DISK and continue? [y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || die "Cancelled — nothing was erased."
+    ok "Target drive set to $TARGET_DISK"
+}
+
+# ---------------------------------------------------------------------
+# Step 3: User account
+# ---------------------------------------------------------------------
+step_user() {
+    banner "STEP 3: User Account"
+    while true; do
+        read -rp "Choose a username: " XYLO_USER
+        [[ "$XYLO_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && break
+        warn "Usernames must be lowercase, start with a letter/underscore, no spaces."
+    done
+    while true; do
+        read -rsp "Enter password: " pw1; echo
+        read -rsp "Confirm password: " pw2; echo
+        if [[ -z "$pw1" ]]; then warn "Password cannot be empty."
+        elif [[ "$pw1" != "$pw2" ]]; then warn "Passwords did not match, try again."
+        else XYLO_PASS="$pw1"; break; fi
+    done
+    ok "User '$XYLO_USER' will be created with sudo privileges."
+}
+
+# ---------------------------------------------------------------------
+# Step 4: Timezone
+# ---------------------------------------------------------------------
+step_timezone() {
+    banner "STEP 4: Localization & Timezone"
+    mapfile -t regions < <(find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 -type d \
+        -printf '%f\n' | grep -Ev '^(posix|right|Etc|SystemV)$' | sort)
+
+    local i=1
+    declare -A region_map=()
+    for r in "${regions[@]}"; do
+        printf '  [%2d] %s\n' "$i" "$r"
+        region_map[$i]="$r"
+        ((i++))
+    done
+    local rchoice region
+    read -rp "Select your region number: " rchoice
+    region="${region_map[$rchoice]:-}"
+    [[ -n "$region" ]] || die "Invalid region selection."
+
+    mapfile -t cities < <(find "/usr/share/zoneinfo/$region" -type f -printf '%f\n' | sort)
+    i=1
+    declare -A city_map=()
+    for c in "${cities[@]}"; do
+        printf '  [%2d] %s\n' "$i" "$c"
+        city_map[$i]="$c"
+        ((i++))
+    done
+    local cchoice city
+    read -rp "Select your city/timezone number: " cchoice
+    city="${city_map[$cchoice]:-}"
+    [[ -n "$city" ]] || die "Invalid timezone selection."
+
+    TIMEZONE="$region/$city"
+    timedatectl set-ntp true 2>/dev/null || true
+    ok "Timezone set to $TIMEZONE (clock will sync via NTP)."
+}
+
+# ---------------------------------------------------------------------
+# Step 5: Desktop environment / window manager
+# ---------------------------------------------------------------------
+step_de() {
+    banner "STEP 5: Desktop Environment / Window Manager"
+
+    local choice=""
+    if command -v dialog &>/dev/null; then
+        choice=$(dialog --clear --backtitle "xyloOS Installer" \
+            --title "Desktop Environment / Window Manager" \
+            --menu "Use Up/Down arrows and Enter to select:" 23 66 16 \
+            "gnome"      "GNOME (GDM)" \
+            "kde"        "KDE Plasma (SDDM)" \
+            "xfce"       "Xfce (LightDM)" \
+            "mate"       "MATE (LightDM)" \
+            "cinnamon"   "Cinnamon (LightDM)" \
+            "lxqt"       "LXQt (SDDM)" \
+            "lxde"       "LXDE (LightDM)" \
+            "budgie"     "Budgie (LightDM)" \
+            "hyprland"   "Hyprland (Wayland tiling WM)" \
+            "sway"       "Sway (Wayland tiling WM)" \
+            "i3"         "i3 (X11 tiling WM)" \
+            "bspwm"      "bspwm (X11 tiling WM)" \
+            "awesome"    "Awesome (X11 tiling WM)" \
+            "xmonad"     "Xmonad (X11 tiling WM)" \
+            "herbstluftwm" "herbstluftwm (X11 tiling WM)" \
+            "dwm"        "dwm (X11 tiling WM)" \
+            "none"       "Minimal CLI Only (no desktop)" \
+            3>&1 1>&2 2>&3)
+        clear
+    fi
+
+    if [[ -z "$choice" ]]; then
+        cat <<'MENU'
+  [1]  GNOME            [2]  KDE Plasma       [3]  Xfce
+  [4]  MATE             [5]  Cinnamon         [6]  LXQt
+  [7]  LXDE             [8]  Budgie           [9]  Hyprland
+  [10] Sway             [11] i3               [12] bspwm
+  [13] Awesome          [14] Xmonad           [15] herbstluftwm
+  [16] dwm              [17] Minimal CLI Only
+MENU
+        local n
+        read -rp "Choose [1-17]: " n
+        local names=(gnome kde xfce mate cinnamon lxqt lxde budgie hyprland sway i3 bspwm awesome xmonad herbstluftwm dwm none)
+        choice="${names[$((n-1))]:-}"
+    fi
+
+    # DE_MODE: "dm" (has a display manager) / "wm-x11" / "wm-wayland" / "none"
+    DE_MODE="dm"
+    WM_EXEC=""
+    local XORG_BASE="xorg-server xorg-xinit xterm"
+    case "$choice" in
+        gnome)    DE_PKGS="gnome-shell gnome-control-center nautilus gnome-terminal gdm"; DE_SERVICE="gdm"; DE_LABEL="GNOME" ;;
+        kde)      DE_PKGS="plasma-desktop sddm konsole dolphin"; DE_SERVICE="sddm"; DE_LABEL="KDE Plasma" ;;
+        xfce)     DE_PKGS="xfce4 xfce4-goodies lightdm lightdm-gtk-greeter"; DE_SERVICE="lightdm"; DE_LABEL="Xfce" ;;
+        mate)     DE_PKGS="mate mate-extra lightdm lightdm-gtk-greeter"; DE_SERVICE="lightdm"; DE_LABEL="MATE" ;;
+        cinnamon) DE_PKGS="cinnamon lightdm lightdm-gtk-greeter"; DE_SERVICE="lightdm"; DE_LABEL="Cinnamon" ;;
+        lxqt)     DE_PKGS="lxqt sddm"; DE_SERVICE="sddm"; DE_LABEL="LXQt" ;;
+        lxde)     DE_PKGS="lxde lightdm lightdm-gtk-greeter"; DE_SERVICE="lightdm"; DE_LABEL="LXDE" ;;
+        budgie)   DE_PKGS="budgie-desktop lightdm lightdm-gtk-greeter"; DE_SERVICE="lightdm"; DE_LABEL="Budgie" ;;
+        hyprland)
+            DE_MODE="wm-wayland"
+            DE_PKGS="hyprland kitty waybar dunst"; WM_EXEC="Hyprland"; DE_LABEL="Hyprland"
+            ;;
+        sway)
+            DE_MODE="wm-wayland"
+            DE_PKGS="sway foot waybar dunst"; WM_EXEC="sway"; DE_LABEL="Sway"
+            ;;
+        i3)
+            DE_MODE="wm-x11"
+            DE_PKGS="$XORG_BASE i3-wm i3status i3lock dmenu rofi feh picom"
+            WM_EXEC="exec i3"; DE_LABEL="i3"
+            ;;
+        bspwm)
+            DE_MODE="wm-x11"
+            DE_PKGS="$XORG_BASE bspwm sxhkd rofi feh picom"
+            WM_EXEC=$'sxhkd &\nexec bspwm'; DE_LABEL="bspwm"
+            ;;
+        awesome)
+            DE_MODE="wm-x11"
+            DE_PKGS="$XORG_BASE awesome"
+            WM_EXEC="exec awesome"; DE_LABEL="Awesome"
+            ;;
+        xmonad)
+            DE_MODE="wm-x11"
+            DE_PKGS="$XORG_BASE xmonad xmonad-contrib"
+            WM_EXEC="exec xmonad"; DE_LABEL="Xmonad"
+            ;;
+        herbstluftwm)
+            DE_MODE="wm-x11"
+            DE_PKGS="$XORG_BASE herbstluftwm"
+            WM_EXEC="exec herbstluftwm"; DE_LABEL="herbstluftwm"
+            ;;
+        dwm)
+            DE_MODE="wm-x11"
+            DE_PKGS="$XORG_BASE dwm dmenu"
+            WM_EXEC="exec dwm"; DE_LABEL="dwm"
+            ;;
+        none|"") DE_MODE="none"; DE_PKGS=""; DE_SERVICE=""; DE_LABEL="Minimal CLI Only" ;;
+        *) die "Invalid selection." ;;
+    esac
+    ok "Desktop selection: $DE_LABEL"
+}
+
+# ---------------------------------------------------------------------
+# Post-selection automation
+# ---------------------------------------------------------------------
+step_install() {
+    banner "Partitioning $TARGET_DISK"
+    wipefs -af "$TARGET_DISK" || true
+    parted -s "$TARGET_DISK" mklabel gpt
+    parted -s "$TARGET_DISK" mkpart ESP fat32 1MiB 513MiB
+    parted -s "$TARGET_DISK" set 1 esp on
+    parted -s "$TARGET_DISK" mkpart primary ext4 513MiB 100%
+    partprobe "$TARGET_DISK" 2>/dev/null || true
+    sleep 1
+
+    local esp root
+    if [[ "$TARGET_DISK" =~ nvme|mmcblk ]]; then
+        esp="${TARGET_DISK}p1"; root="${TARGET_DISK}p2"
+    else
+        esp="${TARGET_DISK}1"; root="${TARGET_DISK}2"
+    fi
+
+    info "Formatting $esp as FAT32 (EFI System Partition)..."
+    mkfs.fat -F32 "$esp"
+    info "Formatting $root as ext4 (root)..."
+    mkfs.ext4 -F "$root"
+
+    mount "$root" /mnt
+    mkdir -p /mnt/boot/efi
+    mount "$esp" /mnt/boot/efi
+
+    # Verify every package in the selected set actually exists on your
+    # mirrors before committing to the install — this is the safety net
+    # for the package-name uncertainty noted at the top of this script.
+    if [[ -n "$DE_PKGS" ]]; then
+        info "Checking package availability for $DE_LABEL..."
+        pacman -Sy &>/dev/null
+        local missing=()
+        for pkg in $DE_PKGS; do
+            pacman -Si "$pkg" &>/dev/null || missing+=("$pkg")
+        done
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            err "These packages were not found on your mirrors: ${missing[*]}"
+            warn "Package names can drift over time — check https://archlinux.org/packages/"
+            warn "for the current name and edit DE_PKGS in this script, or continue"
+            warn "and the base system will still install without this desktop."
+            read -rp "Continue with base install only (no desktop)? [y/N] " r
+            if [[ "$r" =~ ^[Yy]$ ]]; then
+                DE_PKGS=""; DE_MODE="none"; DE_SERVICE=""; DE_LABEL="Minimal CLI Only (packages unavailable)"
+            else
+                die "Aborting so you can fix the package list."
+            fi
+        fi
+    fi
+
+    banner "Installing base system (pacstrap — downloads over your network)"
+    # shellcheck disable=SC2086
+    pacstrap -K /mnt base linux linux-firmware sudo networkmanager iwd \
+        grub efibootmgr os-prober vim nano dialog fastfetch \
+        $DE_PKGS \
+        || die "pacstrap failed. Check network connectivity and retry."
+
+    genfstab -U /mnt >> /mnt/etc/fstab
+
+    echo "xyloos" > /mnt/etc/hostname
+    cat > /mnt/etc/hosts <<EOF
+127.0.0.1   localhost
+127.0.1.1   xyloos
+::1         localhost ip6-localhost ip6-loopback
+EOF
+
+    # Carry the ASCII logo + fastfetch config from the live medium onto
+    # the target, and rebrand the installed system itself (not just the
+    # live ISO) so it actually identifies as xyloOS once installed.
+    if [[ -d /etc/xyloos ]]; then
+        mkdir -p /mnt/etc/xyloos /mnt/etc/skel/.config/fastfetch /mnt/root/.config/fastfetch
+        cp -r /etc/xyloos/. /mnt/etc/xyloos/ 2>/dev/null || true
+        [[ -f /etc/xdg/fastfetch/config.jsonc ]] && { mkdir -p /mnt/etc/xdg/fastfetch; cp /etc/xdg/fastfetch/config.jsonc /mnt/etc/xdg/fastfetch/; }
+        [[ -f /etc/skel/.config/fastfetch/config.jsonc ]] && cp /etc/skel/.config/fastfetch/config.jsonc /mnt/etc/skel/.config/fastfetch/
+        [[ -f /root/.config/fastfetch/config.jsonc ]] && cp /root/.config/fastfetch/config.jsonc /mnt/root/.config/fastfetch/
+    fi
+
+    banner "Configuring the installed system"
+    # arch-chroot (from arch-install-scripts) bind-mounts /dev, /proc,
+    # /sys (including efivars), /run, and copies resolv.conf automatically
+    # — this sidesteps the manual-bind-mount efivars pitfall entirely.
+    arch-chroot /mnt /bin/bash <<CHROOT
+set -e
+ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
+hwclock --systohc
+
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+
+cat > /etc/os-release <<'OSEOF'
+NAME="xyloOS"
+PRETTY_NAME="xyloOS"
+ID=xyloos
+ID_LIKE=arch
+VERSION="1.0"
+ANSI_COLOR="1;36"
+OSEOF
+echo "xyloOS \\n \\l" > /etc/issue
+
+useradd -m -G wheel -s /bin/bash "${XYLO_USER}"
+echo "${XYLO_USER}:${XYLO_PASS}" | chpasswd
+passwd -l root
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+mkinitcpio -P
+
+systemctl enable NetworkManager
+if [[ "${DE_MODE}" == "dm" && -n "${DE_SERVICE}" ]]; then
+    systemctl enable "${DE_SERVICE}" || true
+elif [[ "${DE_MODE}" == "wm-x11" || "${DE_MODE}" == "wm-wayland" ]]; then
+    mkdir -p /etc/systemd/system/getty@tty1.service.d
+    cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'AUTOEOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin ${XYLO_USER} --noclear %I \$TERM
+AUTOEOF
+
+    if [[ "${DE_MODE}" == "wm-x11" ]]; then
+        cat > /home/${XYLO_USER}/.bash_profile <<'PROFEOF'
+if [[ -z "\${DISPLAY}" && "\$(tty)" == "/dev/tty1" ]]; then
+    exec startx
+fi
+PROFEOF
+        cat > /home/${XYLO_USER}/.xinitrc <<'XINITEOF'
+${WM_EXEC}
+XINITEOF
+    else
+        cat > /home/${XYLO_USER}/.bash_profile <<'PROFEOF'
+if [[ -z "\${WAYLAND_DISPLAY}" && -z "\${DISPLAY}" && "\$(tty)" == "/dev/tty1" ]]; then
+    exec ${WM_EXEC}
+fi
+PROFEOF
+    fi
+    chown "${XYLO_USER}:${XYLO_USER}" "/home/${XYLO_USER}/.bash_profile"
+    [[ -f "/home/${XYLO_USER}/.xinitrc" ]] && chown "${XYLO_USER}:${XYLO_USER}" "/home/${XYLO_USER}/.xinitrc"
+fi
+
+if command -v fastfetch &>/dev/null; then
+    cat >> /etc/bash.bashrc <<'FFEOF'
+
+# xyloOS: show system info banner on interactive shell login
+if [[ \$- == *i* ]] && [[ -z "\$XYLOOS_FASTFETCH_SHOWN" ]] && command -v fastfetch &>/dev/null; then
+    export XYLOOS_FASTFETCH_SHOWN=1
+    fastfetch
+fi
+FFEOF
+fi
+
+if [[ -d /sys/firmware/efi ]]; then
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=xyloOS
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable
+else
+    grub-install --target=i386-pc "${TARGET_DISK}"
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
+CHROOT
+    local rc=$?
+    [[ $rc -eq 0 ]] || die "System configuration inside chroot failed."
+
+    umount -R /mnt
+    ok "xyloOS installation complete."
+}
+
+# ---------------------------------------------------------------------
+# Main flow
+# ---------------------------------------------------------------------
+main() {
+    require_root
+    clear
+    cat <<'BANNER'
+                             @@@@@@@@@@@@                             
+                          @@@@@@@@@@@@@@@@@@@@@@                        
+                        @@@@@@@@@@@@@@@@@@@@@@@@@@@                     
+                     @@@@@@@@@@@@@@........@@@@@@@@@@                   
+                    @@@@@@@@@@@@...............@@@@@@@@                 
+                  @@@@@@@@@@@@......@@@@@@@@@@@=.@@@@@@@                
+                 @@@@@.@@@@@.....@@@@@@@@@@@@@@@@@@@@@@@@               
+                @@@@@..@@@@@...@@@@@@@@@@@@@@@@@@@@@@@@@@@              
+               .@@@@:.@@@@@...@@@@@@@@@@@@@@@@@@@@@@@@@@@@@             
+               @@@@@..@@@@@..@@@@@@@............@@@@@@@@@@@.            
+              .@@@@...@@@@@.@@@@@@................@@@@@@@@@.            
+              @@@@@...@@@@@@@@@@....................@@@@@@@@.           
+              @@@@@....@@@@@@@@.........       ......@@@@@@%.           
+              .@@@@....@@@@@@@@......            ....@@@@@@..           
+              .@@@@@....@@@@@@.....               ...@@@@@@..           
+              ..@@@@.....+@@@@.....                ..@@@@@...           
+              ..@@@@@......@@@@...                 ..@@@@@...           
+               ..@@@@@........@@..                 ..@@@@...            
+               ...@@@@@...........                 .@@@@....            
+                ...@@%@@..........                @@@@@....             
+                 ...@@@@@@. .....                @@@@@....              
+                  ....@@*@@@@@                @@%@@@.....               
+                    ....@@@+.@@@@@        @@@@@#@@......                
+                     ......@@@@=.=@@@@@@@@@@@@@.......                  
+                       ........*@@@@@@@@@@@.........                    
+                          .......................                       
+                              ................                          
+
+                     xyloOS Installation Wizard
+BANNER
+
+    while ! step_wifi; do
+        echo
+        warn "Wi-Fi setup did not complete."
+        read -rp "Try Wi-Fi setup again? [Y/n] " retry_net
+        if [[ ! ${retry_net:-Y} =~ ^[Yy] ]]; then
+            warn "Continuing without confirmed internet access."
+            warn "The install step later on needs internet to fetch packages,"
+            warn "so make sure you have a wired connection before proceeding."
+            break
+        fi
+    done
+    step_disk
+    step_user
+    step_timezone
+    step_de
+
+    banner "Ready to Install"
+    cat <<SUMMARY
+  Target drive : $TARGET_DISK
+  Username     : $XYLO_USER
+  Timezone     : $TIMEZONE
+  Desktop      : $DE_LABEL
+SUMMARY
+    echo
+    read -rp "Proceed with installation? THIS ERASES $TARGET_DISK [y/N]: " go
+    [[ "$go" =~ ^[Yy]$ ]] || die "Installation cancelled by user."
+
+    step_install
+
+    echo
+    read -rp "Installation finished. Reboot now? [Y/n] " r
+    [[ ${r:-Y} =~ ^[Yy] ]] && reboot
+}
+
+main "$@"
