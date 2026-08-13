@@ -1,0 +1,52 @@
+name: Build xyloOS ISO
+
+# Builds the Arch-based xyloOS ISO on GitHub's own Linux runners, inside an
+# official archlinux container — so you don't need your own Arch machine,
+# VM, or Docker setup. Runs automatically on every push, and can also be
+# triggered manually from the Actions tab ("Run workflow").
+#
+# When it finishes, the built ISO is attached to the workflow run as a
+# downloadable artifact (look under the run's "Artifacts" section).
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Update mirrors and keyring
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm
+
+      - name: Run build.sh
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Show build output
+        run: ls -lh out/
+
+      - name: Upload ISO as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xyloOS-iso
+          path: out/*.iso
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xyloOS-build-logs
+          path: xyloos-work/mkarchiso-work/**/build.log
+          if-no-files-found: ignore
