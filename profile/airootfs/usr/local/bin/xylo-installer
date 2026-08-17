@@ -47,6 +47,7 @@ DE_SERVICE=""
 DE_LABEL="Minimal CLI Only"
 DE_MODE="none"
 WM_EXEC=""
+BUILD_DWM_FROM_SOURCE=""
 
 # ---------------------------------------------------------------------
 # Step 1: Wi-Fi
@@ -403,8 +404,9 @@ MENU
             ;;
         dwm)
             DE_MODE="wm-x11"
-            DE_PKGS="$XORG_BASE dwm dmenu"
-            WM_EXEC="exec dwm"; DE_LABEL="dwm"
+            DE_PKGS="$XORG_BASE dmenu base-devel git libx11 libxinerama libxft"
+            WM_EXEC="exec dwm"; DE_LABEL="dwm (built from source)"
+            BUILD_DWM_FROM_SOURCE=1
             ;;
         none|"") DE_MODE="none"; DE_PKGS=""; DE_SERVICE=""; DE_LABEL="Minimal CLI Only" ;;
         *) die "Invalid selection." ;;
@@ -519,6 +521,15 @@ useradd -m -G wheel -s /bin/bash "${XYLO_USER}"
 echo "${XYLO_USER}:${XYLO_PASS}" | chpasswd
 passwd -l root
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+if [[ "${BUILD_DWM_FROM_SOURCE}" == "1" ]]; then
+    mkdir -p /usr/local/src
+    cd /usr/local/src
+    git clone https://git.suckless.org/dwm
+    cd dwm
+    make clean install
+    cd /
+fi
 
 mkinitcpio -P
 
