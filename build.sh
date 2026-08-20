@@ -145,7 +145,6 @@ awesome
 xmonad
 xmonad-contrib
 herbstluftwm
-dwm
 EOF
 sort -u -o "${PROFILE_DIR}/packages.x86_64" "${PROFILE_DIR}/packages.x86_64"
 c_red "NOTE: this package list was written from best available knowledge of"
