@@ -2,16 +2,12 @@
 #
 # xylo-installer — xyloOS interactive installation wizard (Arch Linux base)
 #
-# Mirrors the feature set and fixes of the Ubuntu-based xyloos-install:
-#   - Wi-Fi via iwctl with an arrow-key dialog menu, real DHCP (dhcpcd)
-#   - Disk selection with a y/n confirm and automatic boot-medium exclusion
-#   - User account creation with sudo
-#   - Timezone selection
-#   - 17-option DE/WM picker via dialog (black theme)
-#   - pacstrap + arch-chroot install, with GRUB installed for both the
-#     registered NVRAM entry and the removable/fallback path
-#   - A safety net in the launching .bash_profile so no failure silently
-#     dumps you at an unexplained shell (see build.sh)
+# Flow: Language -> Wi-Fi/Network -> Region & Timezone -> User Account ->
+#       Desktop Environment -> Target Drive -> Install
+#
+# Everything below is dialog-menu / dialog-select driven. Free text is only
+# ever asked for username, password, and manual SSID/device entry as a
+# fallback when auto-detection finds nothing.
 #
 # NOTE ON PACKAGE NAMES: these were written from best available knowledge
 # of Arch's official repos, not verified against a live pacman database (no
@@ -37,11 +33,46 @@ require_root() { [[ $EUID -eq 0 ]] || die "Run as root."; }
 trap 'echo; err "Interrupted."; exit 130' INT TERM
 
 [[ -f /etc/xyloos/dialogrc ]] && export DIALOGRC=/etc/xyloos/dialogrc
+HAVE_DIALOG=0
+command -v dialog &>/dev/null && HAVE_DIALOG=1
+
+# Small helper: yes/no confirm, dialog when available, plain read as a
+# last-resort fallback (only reachable if dialog is somehow missing).
+confirm() {
+    local prompt="$1"
+    if [[ $HAVE_DIALOG -eq 1 ]]; then
+        dialog --clear --backtitle "xyloOS Installer" --title "Confirm" \
+            --yesno "$prompt" 12 66
+        local rc=$?
+        clear
+        [[ $rc -eq 0 ]] && return 0 || return 1
+    fi
+    local ans
+    read -rp "$prompt [y/N] " ans
+    [[ "$ans" =~ ^[Yy] ]]
+}
+
+# Small helper: single-line menu, dialog when available.
+menu_pick() {
+    # $1=title  $2=prompt  $3=height  $4=width  $5=menu-height  then tag/desc pairs...
+    local title="$1" prompt="$2" h="$3" w="$4" mh="$5"; shift 5
+    if [[ $HAVE_DIALOG -eq 1 ]]; then
+        local out
+        out=$(dialog --clear --backtitle "xyloOS Installer" --title "$title" \
+            --menu "$prompt" "$h" "$w" "$mh" "$@" 3>&1 1>&2 2>&3)
+        clear
+        printf '%s' "$out"
+        return 0
+    fi
+    return 1
+}
 
 TARGET_DISK=""
 XYLO_USER=""
 XYLO_PASS=""
 TIMEZONE="UTC"
+LOCALE="en_US.UTF-8"
+LANG_LABEL="English (US)"
 DE_PKGS=""
 DE_SERVICE=""
 DE_LABEL="Minimal CLI Only"
@@ -50,10 +81,56 @@ WM_EXEC=""
 BUILD_DWM_FROM_SOURCE=""
 
 # ---------------------------------------------------------------------
-# Step 1: Wi-Fi
+# Step 1: Language
+# ---------------------------------------------------------------------
+step_lang() {
+    banner "STEP 1: Language"
+    local choice
+    choice=$(menu_pick "Select Language" "Use Up/Down arrows and Enter to select:" 22 60 15 \
+        "en_US" "English (US)" \
+        "en_GB" "English (UK)" \
+        "es_ES" "Espanol (Spanish)" \
+        "fr_FR" "Francais (French)" \
+        "de_DE" "Deutsch (German)" \
+        "it_IT" "Italiano (Italian)" \
+        "pt_BR" "Portugues (Brazil)" \
+        "ru_RU" "Russian" \
+        "ja_JP" "Japanese" \
+        "zh_CN" "Chinese (Simplified)" \
+        "ar_SA" "Arabic" \
+        "hi_IN" "Hindi" \
+        "ko_KR" "Korean" \
+        "nl_NL" "Nederlands (Dutch)" \
+        "pl_PL" "Polski (Polish)" \
+        "tr_TR" "Turkce (Turkish)")
+
+    case "$choice" in
+        en_US) LOCALE="en_US.UTF-8"; LANG_LABEL="English (US)" ;;
+        en_GB) LOCALE="en_GB.UTF-8"; LANG_LABEL="English (UK)" ;;
+        es_ES) LOCALE="es_ES.UTF-8"; LANG_LABEL="Espanol (Spanish)" ;;
+        fr_FR) LOCALE="fr_FR.UTF-8"; LANG_LABEL="Francais (French)" ;;
+        de_DE) LOCALE="de_DE.UTF-8"; LANG_LABEL="Deutsch (German)" ;;
+        it_IT) LOCALE="it_IT.UTF-8"; LANG_LABEL="Italiano (Italian)" ;;
+        pt_BR) LOCALE="pt_BR.UTF-8"; LANG_LABEL="Portugues (Brazil)" ;;
+        ru_RU) LOCALE="ru_RU.UTF-8"; LANG_LABEL="Russian" ;;
+        ja_JP) LOCALE="ja_JP.UTF-8"; LANG_LABEL="Japanese" ;;
+        zh_CN) LOCALE="zh_CN.UTF-8"; LANG_LABEL="Chinese (Simplified)" ;;
+        ar_SA) LOCALE="ar_SA.UTF-8"; LANG_LABEL="Arabic" ;;
+        hi_IN) LOCALE="hi_IN.UTF-8"; LANG_LABEL="Hindi" ;;
+        ko_KR) LOCALE="ko_KR.UTF-8"; LANG_LABEL="Korean" ;;
+        nl_NL) LOCALE="nl_NL.UTF-8"; LANG_LABEL="Nederlands (Dutch)" ;;
+        pl_PL) LOCALE="pl_PL.UTF-8"; LANG_LABEL="Polski (Polish)" ;;
+        tr_TR) LOCALE="tr_TR.UTF-8"; LANG_LABEL="Turkce (Turkish)" ;;
+        *) LOCALE="en_US.UTF-8"; LANG_LABEL="English (US)" ;;
+    esac
+    ok "Language set to $LANG_LABEL"
+}
+
+# ---------------------------------------------------------------------
+# Step 2: Wi-Fi / Network
 # ---------------------------------------------------------------------
 step_wifi() {
-    banner "STEP 1: Network Connectivity"
+    banner "STEP 2: Network Connectivity"
     if ping -c1 -W2 archlinux.org &>/dev/null; then
         ok "Already online (wired connection or previously connected)."
         return 0
@@ -122,7 +199,7 @@ step_wifi() {
         fi
 
         local ssid=""
-        if [[ ${#uniq_list[@]} -gt 0 ]] && command -v dialog &>/dev/null; then
+        if [[ ${#uniq_list[@]} -gt 0 && $HAVE_DIALOG -eq 1 ]]; then
             local menu_items=()
             for s in "${uniq_list[@]}"; do
                 menu_items+=("$s" "")
@@ -144,12 +221,11 @@ step_wifi() {
         fi
         if [[ -z "$ssid" ]]; then
             warn "No network selected."
-            read -rp "Try again? [Y/n] " r
-            if [[ ${r:-Y} =~ ^[Yy] ]]; then continue; else return 1; fi
+            if confirm "Try Wi-Fi setup again?"; then continue; else return 1; fi
         fi
 
         local pass
-        if command -v dialog &>/dev/null; then
+        if [[ $HAVE_DIALOG -eq 1 ]]; then
             pass=$(dialog --clear --backtitle "xyloOS Installer" \
                 --title "Wi-Fi Password" \
                 --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60 \
@@ -176,8 +252,7 @@ step_wifi() {
         done
         if [[ -z "$linked" ]]; then
             err "Could not associate with '$ssid' — double-check the password."
-            read -rp "Try again? [Y/n] " r
-            if [[ ${r:-Y} =~ ^[Yy] ]]; then continue; else return 1; fi
+            if confirm "Try again?"; then continue; else return 1; fi
         fi
 
         # iwd only brings up the wireless link; it does not request an IP.
@@ -196,117 +271,90 @@ step_wifi() {
             return 0
         else
             err "Linked to '$ssid' but couldn't reach the internet (no IP address or no route)."
-            read -rp "Try a different network? [Y/n] " r
-            if [[ ${r:-Y} =~ ^[Yy] ]]; then continue; else return 1; fi
+            if confirm "Try a different network?"; then continue; else return 1; fi
         fi
     done
 }
 
 # ---------------------------------------------------------------------
-# Step 2: Target drive
+# Step 3: Region & Timezone
 # ---------------------------------------------------------------------
-step_disk() {
-    banner "STEP 2: Target Installation Drive"
-    echo
+step_timezone() {
+    banner "STEP 3: Region & Timezone"
+    mapfile -t regions < <(find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 -type d \
+        -printf '%f\n' | grep -Ev '^(posix|right|Etc|SystemV)$' | sort)
 
-    # Never let the boot medium itself show up as an install target.
-    # archiso mounts the live medium at /run/archiso/bootmnt.
-    local boot_part boot_disk
-    boot_part=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null)
-    if [[ -n "$boot_part" ]]; then
-        boot_disk=$(lsblk -no PKNAME "$boot_part" 2>/dev/null)
+    local region=""
+    if [[ $HAVE_DIALOG -eq 1 ]]; then
+        local menu_items=()
+        for r in "${regions[@]}"; do
+            menu_items+=("$r" "")
+        done
+        region=$(dialog --clear --backtitle "xyloOS Installer" \
+            --title "Select Region" \
+            --menu "Use Up/Down arrows and Enter to select:" 22 50 15 \
+            "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        clear
     fi
+    [[ -n "$region" ]] || die "No region selected."
 
-    declare -gA disk_map=()
-    local i=1 d size model
-    mapfile -t disks < <(lsblk -dn -e7,11 -o NAME,TYPE,SIZE | awk '$2=="disk" && $3!="0B"{print $1}')
-    [[ ${#disks[@]} -gt 0 ]] || die "No storage drives detected."
-
-    printf '%s%-4s %-14s %-10s %s%s\n' "$BOLD" "#" "DEVICE" "SIZE" "MODEL" "$RESET"
-    for d in "${disks[@]}"; do
-        if [[ -n "$boot_disk" && "$d" == "$boot_disk" ]]; then
-            continue
-        fi
-        size=$(lsblk -dn -o SIZE "/dev/$d")
-        model=$(lsblk -dn -o MODEL "/dev/$d" 2>/dev/null)
-        printf '%-4s %-14s %-10s %s\n' "$i" "/dev/$d" "$size" "$model"
-        disk_map[$i]="/dev/$d"
-        ((i++))
-    done
-    if [[ -n "$boot_disk" ]]; then
-        info "(/dev/$boot_disk — your xyloOS boot drive — is hidden from this list for safety)"
+    mapfile -t cities < <(find "/usr/share/zoneinfo/$region" -type f -printf '%f\n' | sort)
+    local city=""
+    if [[ $HAVE_DIALOG -eq 1 ]]; then
+        local menu_items=()
+        for c in "${cities[@]}"; do
+            menu_items+=("$c" "")
+        done
+        city=$(dialog --clear --backtitle "xyloOS Installer" \
+            --title "Select City / Timezone ($region)" \
+            --menu "Use Up/Down arrows and Enter to select:" 22 60 15 \
+            "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        clear
     fi
-    [[ ${#disk_map[@]} -gt 0 ]] || die "No installable drives found (only the boot USB was detected)."
+    [[ -n "$city" ]] || die "No timezone selected."
 
-    echo
-    local choice
-    read -rp "Select target drive number: " choice
-    TARGET_DISK="${disk_map[$choice]:-}"
-    [[ -n "$TARGET_DISK" ]] || die "Invalid selection."
-
-    echo
-    warn "ALL DATA ON $TARGET_DISK WILL BE PERMANENTLY ERASED."
-    read -rp "Erase $TARGET_DISK and continue? [y/N] " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || die "Cancelled — nothing was erased."
-    ok "Target drive set to $TARGET_DISK"
+    TIMEZONE="$region/$city"
+    timedatectl set-ntp true 2>/dev/null || true
+    ok "Timezone set to $TIMEZONE (clock will sync via NTP)."
 }
 
 # ---------------------------------------------------------------------
-# Step 3: User account
+# Step 4: User account
 # ---------------------------------------------------------------------
 step_user() {
-    banner "STEP 3: User Account"
+    banner "STEP 4: User Account"
     while true; do
-        read -rp "Choose a username: " XYLO_USER
+        if [[ $HAVE_DIALOG -eq 1 ]]; then
+            XYLO_USER=$(dialog --clear --backtitle "xyloOS Installer" --title "User Account" \
+                --inputbox "Choose a username (lowercase, no spaces):" 10 60 \
+                3>&1 1>&2 2>&3)
+            clear
+        else
+            read -rp "Choose a username: " XYLO_USER
+        fi
         [[ "$XYLO_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && break
         warn "Usernames must be lowercase, start with a letter/underscore, no spaces."
     done
     while true; do
-        read -rsp "Enter password: " pw1; echo
-        read -rsp "Confirm password: " pw2; echo
+        local pw1 pw2
+        if [[ $HAVE_DIALOG -eq 1 ]]; then
+            pw1=$(dialog --clear --backtitle "xyloOS Installer" --title "Password" \
+                --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60 \
+                3>&1 1>&2 2>&3)
+            clear
+            pw2=$(dialog --clear --backtitle "xyloOS Installer" --title "Password" \
+                --insecure --passwordbox "Confirm password:" 10 60 \
+                3>&1 1>&2 2>&3)
+            clear
+        else
+            read -rsp "Enter password: " pw1; echo
+            read -rsp "Confirm password: " pw2; echo
+        fi
         if [[ -z "$pw1" ]]; then warn "Password cannot be empty."
         elif [[ "$pw1" != "$pw2" ]]; then warn "Passwords did not match, try again."
         else XYLO_PASS="$pw1"; break; fi
     done
     ok "User '$XYLO_USER' will be created with sudo privileges."
-}
-
-# ---------------------------------------------------------------------
-# Step 4: Timezone
-# ---------------------------------------------------------------------
-step_timezone() {
-    banner "STEP 4: Localization & Timezone"
-    mapfile -t regions < <(find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 -type d \
-        -printf '%f\n' | grep -Ev '^(posix|right|Etc|SystemV)$' | sort)
-
-    local i=1
-    declare -A region_map=()
-    for r in "${regions[@]}"; do
-        printf '  [%2d] %s\n' "$i" "$r"
-        region_map[$i]="$r"
-        ((i++))
-    done
-    local rchoice region
-    read -rp "Select your region number: " rchoice
-    region="${region_map[$rchoice]:-}"
-    [[ -n "$region" ]] || die "Invalid region selection."
-
-    mapfile -t cities < <(find "/usr/share/zoneinfo/$region" -type f -printf '%f\n' | sort)
-    i=1
-    declare -A city_map=()
-    for c in "${cities[@]}"; do
-        printf '  [%2d] %s\n' "$i" "$c"
-        city_map[$i]="$c"
-        ((i++))
-    done
-    local cchoice city
-    read -rp "Select your city/timezone number: " cchoice
-    city="${city_map[$cchoice]:-}"
-    [[ -n "$city" ]] || die "Invalid timezone selection."
-
-    TIMEZONE="$region/$city"
-    timedatectl set-ntp true 2>/dev/null || true
-    ok "Timezone set to $TIMEZONE (clock will sync via NTP)."
 }
 
 # ---------------------------------------------------------------------
@@ -316,32 +364,27 @@ step_de() {
     banner "STEP 5: Desktop Environment / Window Manager"
 
     local choice=""
-    if command -v dialog &>/dev/null; then
-        choice=$(dialog --clear --backtitle "xyloOS Installer" \
-            --title "Desktop Environment / Window Manager" \
-            --menu "Use Up/Down arrows and Enter to select:" 23 66 16 \
-            "gnome"      "GNOME (GDM)" \
-            "kde"        "KDE Plasma (SDDM)" \
-            "xfce"       "Xfce (LightDM)" \
-            "mate"       "MATE (LightDM)" \
-            "cinnamon"   "Cinnamon (LightDM)" \
-            "lxqt"       "LXQt (SDDM)" \
-            "lxde"       "LXDE (LightDM)" \
-            "budgie"     "Budgie (LightDM)" \
-            "hyprland"   "Hyprland (Wayland tiling WM)" \
-            "sway"       "Sway (Wayland tiling WM)" \
-            "i3"         "i3 (X11 tiling WM)" \
-            "bspwm"      "bspwm (X11 tiling WM)" \
-            "awesome"    "Awesome (X11 tiling WM)" \
-            "xmonad"     "Xmonad (X11 tiling WM)" \
-            "herbstluftwm" "herbstluftwm (X11 tiling WM)" \
-            "dwm"        "dwm (X11 tiling WM)" \
-            "none"       "Minimal CLI Only (no desktop)" \
-            3>&1 1>&2 2>&3)
-        clear
-    fi
+    choice=$(menu_pick "Desktop Environment / Window Manager" \
+        "Use Up/Down arrows and Enter to select:" 23 66 16 \
+        "gnome"      "GNOME (GDM)" \
+        "kde"        "KDE Plasma (SDDM)" \
+        "xfce"       "Xfce (LightDM)" \
+        "mate"       "MATE (LightDM)" \
+        "cinnamon"   "Cinnamon (LightDM)" \
+        "lxqt"       "LXQt (SDDM)" \
+        "lxde"       "LXDE (LightDM)" \
+        "budgie"     "Budgie (LightDM)" \
+        "hyprland"   "Hyprland (Wayland tiling WM)" \
+        "sway"       "Sway (Wayland tiling WM)" \
+        "i3"         "i3 (X11 tiling WM)" \
+        "bspwm"      "bspwm (X11 tiling WM)" \
+        "awesome"    "Awesome (X11 tiling WM)" \
+        "xmonad"     "Xmonad (X11 tiling WM)" \
+        "herbstluftwm" "herbstluftwm (X11 tiling WM)" \
+        "dwm"        "dwm (X11 tiling WM)" \
+        "none"       "Minimal CLI Only (no desktop)")
 
-    if [[ -z "$choice" ]]; then
+    if [[ -z "$choice" && $HAVE_DIALOG -ne 1 ]]; then
         cat <<'MENU'
   [1]  GNOME            [2]  KDE Plasma       [3]  Xfce
   [4]  MATE             [5]  Cinnamon         [6]  LXQt
@@ -415,6 +458,58 @@ MENU
 }
 
 # ---------------------------------------------------------------------
+# Step 6: Target drive (last step before install)
+# ---------------------------------------------------------------------
+step_disk() {
+    banner "STEP 6: Target Installation Drive"
+    echo
+
+    # Never let the boot medium itself show up as an install target.
+    # archiso mounts the live medium at /run/archiso/bootmnt.
+    local boot_part boot_disk
+    boot_part=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null)
+    if [[ -n "$boot_part" ]]; then
+        boot_disk=$(lsblk -no PKNAME "$boot_part" 2>/dev/null)
+    fi
+
+    declare -gA disk_map=()
+    local i=1 d size model
+    mapfile -t disks < <(lsblk -dn -e7,11 -o NAME,TYPE,SIZE | awk '$2=="disk" && $3!="0B"{print $1}')
+    [[ ${#disks[@]} -gt 0 ]] || die "No storage drives detected."
+
+    local menu_items=()
+    for d in "${disks[@]}"; do
+        if [[ -n "$boot_disk" && "$d" == "$boot_disk" ]]; then
+            continue
+        fi
+        size=$(lsblk -dn -o SIZE "/dev/$d")
+        model=$(lsblk -dn -o MODEL "/dev/$d" 2>/dev/null)
+        menu_items+=("/dev/$d" "$size  $model")
+        disk_map[$i]="/dev/$d"
+        ((i++))
+    done
+    if [[ -n "$boot_disk" ]]; then
+        info "(/dev/$boot_disk — your xyloOS boot drive — is hidden from this list for safety)"
+    fi
+    [[ ${#menu_items[@]} -gt 0 ]] || die "No installable drives found (only the boot USB was detected)."
+
+    TARGET_DISK=""
+    if [[ $HAVE_DIALOG -eq 1 ]]; then
+        TARGET_DISK=$(dialog --clear --backtitle "xyloOS Installer" \
+            --title "Select Target Drive" \
+            --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
+            18 60 8 "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        clear
+    fi
+    [[ -n "$TARGET_DISK" ]] || die "Invalid selection."
+
+    if ! confirm "ALL DATA ON $TARGET_DISK WILL BE PERMANENTLY ERASED.\n\nErase $TARGET_DISK and continue?"; then
+        die "Cancelled — nothing was erased."
+    fi
+    ok "Target drive set to $TARGET_DISK"
+}
+
+# ---------------------------------------------------------------------
 # Post-selection automation
 # ---------------------------------------------------------------------
 step_install() {
@@ -458,8 +553,7 @@ step_install() {
             warn "Package names can drift over time — check https://archlinux.org/packages/"
             warn "for the current name and edit DE_PKGS in this script, or continue"
             warn "and the base system will still install without this desktop."
-            read -rp "Continue with base install only (no desktop)? [y/N] " r
-            if [[ "$r" =~ ^[Yy]$ ]]; then
+            if confirm "Continue with base install only (no desktop)?"; then
                 DE_PKGS=""; DE_MODE="none"; DE_SERVICE=""; DE_LABEL="Minimal CLI Only (packages unavailable)"
             else
                 die "Aborting so you can fix the package list."
@@ -503,9 +597,9 @@ set -e
 ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
 hwclock --systohc
 
-echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+echo "${LOCALE} UTF-8" >> /etc/locale.gen
 locale-gen
-echo "LANG=en_US.UTF-8" > /etc/locale.conf
+echo "LANG=${LOCALE}" > /etc/locale.conf
 
 cat > /etc/os-release <<'OSEOF'
 NAME="xyloOS"
@@ -627,39 +721,38 @@ main() {
 
                      xyloOS Installation Wizard
 BANNER
+    sleep 1
+
+    step_lang
 
     while ! step_wifi; do
         echo
         warn "Wi-Fi setup did not complete."
-        read -rp "Try Wi-Fi setup again? [Y/n] " retry_net
-        if [[ ! ${retry_net:-Y} =~ ^[Yy] ]]; then
+        if confirm "Try Wi-Fi setup again?"; then
+            continue
+        else
             warn "Continuing without confirmed internet access."
             warn "The install step later on needs internet to fetch packages,"
             warn "so make sure you have a wired connection before proceeding."
             break
         fi
     done
-    step_disk
-    step_user
     step_timezone
+    step_user
     step_de
+    step_disk
 
     banner "Ready to Install"
-    cat <<SUMMARY
-  Target drive : $TARGET_DISK
-  Username     : $XYLO_USER
-  Timezone     : $TIMEZONE
-  Desktop      : $DE_LABEL
-SUMMARY
-    echo
-    read -rp "Proceed with installation? THIS ERASES $TARGET_DISK [y/N]: " go
-    [[ "$go" =~ ^[Yy]$ ]] || die "Installation cancelled by user."
+    if ! confirm "Language      : $LANG_LABEL\nTimezone      : $TIMEZONE\nUsername      : $XYLO_USER\nDesktop       : $DE_LABEL\nTarget drive  : $TARGET_DISK\n\nTHIS ERASES $TARGET_DISK.\n\nProceed with installation?"; then
+        die "Installation cancelled by user."
+    fi
 
     step_install
 
     echo
-    read -rp "Installation finished. Reboot now? [Y/n] " r
-    [[ ${r:-Y} =~ ^[Yy] ]] && reboot
+    if confirm "Installation finished. Reboot now?"; then
+        reboot
+    fi
 }
 
 main "$@"
