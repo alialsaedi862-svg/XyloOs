@@ -3,8 +3,8 @@
 # build.sh
 # ---------------------------------------------------------------------------
 # Builds "xyloOS" — a rebranded, lightweight Arch-Linux-based installer ISO,
-# bootable via BIOS (isolinux/syslinux) and UEFI (GRUB), hybrid-formatted so
-# tools like Rufus can write it straight to a USB drive.
+# bootable via BIOS (isolinux/syslinux) and UEFI (systemd-boot), hybrid-
+# formatted so tools like Rufus can write it straight to a USB drive.
 #
 # MUST be run as root on an Arch Linux machine (bare metal, VM, or an
 # `archlinux` Docker/systemd-nspawn container) — mkarchiso is Arch-only
@@ -14,14 +14,18 @@
 #   1. Installs archiso if it isn't already present
 #   2. Copies the upstream `releng` archiso profile as a base skeleton
 #   3. Overlays this kit's profile/ directory on top (motd, xylo-installer,
-#      grub.cfg, splash.png — the files you can see and edit directly)
+#      splash.png — the files you can see and edit directly)
 #   4. Rebrands profiledef.sh, os-release, hostname, package list
-#   5. Substitutes the %ISO_LABEL% / %INSTALL_DIR% tokens into grub.cfg
-#   6. Adds the black dialog theme and autostarts xylo-installer on tty1,
-#      wrapped in a safety-net loop so no crash silently dumps you at an
-#      unexplained shell
-#   7. Writes a clean 4-item syslinux (BIOS) boot menu
-#   8. Runs mkarchiso to produce the final .iso
+#   5. Rebrands and hides the UEFI boot menu (systemd-boot: this profile's
+#      actual UEFI boot mode — see profiledef.sh bootmodes) so it boots
+#      straight into xyloOS with zero "Arch" branding and no visible menu
+#   6. Sets up a Plymouth splash (using splash.png + a spinner) and quiet
+#      boot kernel params so the verbose systemd startup log is hidden
+#   7. Adds the black dialog theme and autostarts xylo-installer on tty1
+#      unconditionally (no fragile tty-matching — this medium's root
+#      account exists only to run the installer)
+#   8. Writes a clean 4-item syslinux (BIOS) boot menu
+#   9. Runs mkarchiso to produce the final .iso
 #
 # Usage:
 #   sudo ./build.sh
@@ -41,6 +45,9 @@ ISO_LABEL="XYLOOS_$(date +%Y%m)"
 ISO_PUBLISHER="xyloOS Project"
 ISO_APPLICATION="xyloOS Live/Installer"
 INSTALL_DIR="xyloos"
+# Kernel params shared by both boot paths (UEFI systemd-boot + BIOS syslinux)
+# to hide the verbose systemd startup log behind the Plymouth splash.
+QUIET_PARAMS="quiet splash loglevel=3 systemd.show_status=false rd.udev.log_level=3 vt.global_cursor_default=0"
 
 c_green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 c_red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
@@ -81,11 +88,12 @@ sed -i \
 
 # ---- 4. Package list additions ----------------------------------------------
 # This is the full set needed across all 17 DE/WM options in xylo-installer,
-# plus core installer tooling. xylo-installer itself double-checks each
-# selected DE/WM's packages against your actual mirrors before installing
-# (pacman -Si) since a couple of these names could not be verified against
-# a live Arch repo in the environment that authored this kit.
-c_green "==> Adding installer + DE/WM dependencies to packages.x86_64..."
+# plus core installer tooling and plymouth (boot splash). xylo-installer
+# itself double-checks each selected DE/WM's packages against your actual
+# mirrors before installing (pacman -Si) since a couple of these names
+# could not be verified against a live Arch repo in the environment that
+# authored this kit.
+c_green "==> Adding installer + DE/WM + splash dependencies to packages.x86_64..."
 cat >> "${PROFILE_DIR}/packages.x86_64" <<'EOF'
 dialog
 base-devel
@@ -104,6 +112,7 @@ efibootmgr
 os-prober
 reflector
 fastfetch
+plymouth
 gnome-shell
 gnome-control-center
 nautilus
@@ -220,7 +229,66 @@ searchbox_border2_color = dialog_color
 menubox_border2_color = dialog_color
 EOF
 
-# ---- 7. Autostart the wizard on tty1, with a crash-safety net --------------
+# ---- 7. Plymouth boot splash (logo + spinner, replaces verbose boot text) --
+# Best-effort: this could not be tested against a live Arch/plymouth
+# environment. If the splash doesn't render right, boot still proceeds
+# normally (quiet kernel params alone already hide most of the log text) —
+# this is the single most likely spot to need another CI-iteration fix.
+c_green "==> Installing Plymouth splash theme..."
+[[ -f "${PROFILE_DIR}/grub/splash.png" ]] || die "profile/grub/splash.png is missing."
+PLY_THEME_DIR="${AIROOTFS}/usr/share/plymouth/themes/xyloos"
+mkdir -p "$PLY_THEME_DIR"
+cp "${PROFILE_DIR}/grub/splash.png" "${PLY_THEME_DIR}/splash.png"
+
+cat > "${PLY_THEME_DIR}/xyloos.plymouth" <<'EOF'
+[Plymouth Theme]
+Name=xyloOS
+Description=xyloOS boot splash
+ModuleName=two-step
+
+[two-step]
+ImageDir=/usr/share/plymouth/themes/spinner
+WatermarkImage=/usr/share/plymouth/themes/xyloos/splash.png
+WatermarkHorizontalAlignment=.5
+WatermarkVerticalAlignment=.4
+HorizontalAlignment=.5
+VerticalAlignment=.75
+Transition=none
+TransitionDuration=0.0
+BackgroundStartColor=0x000000
+BackgroundEndColor=0x000000
+EOF
+
+# Set it as the default theme + bake it into the live initramfs.
+mkdir -p "${AIROOTFS}/etc/plymouth"
+cat > "${AIROOTFS}/etc/plymouth/plymouthd.conf" <<'EOF'
+[Daemon]
+Theme=xyloos
+EOF
+
+# Insert the plymouth hook into the live-environment mkinitcpio config
+# right after "base udev" (preserving whatever else releng already has
+# there, rather than guessing the full HOOKS line and overwriting it).
+MKINITCPIO_ARCHISO="${AIROOTFS}/etc/mkinitcpio.conf.d/archiso.conf"
+if [[ -f "$MKINITCPIO_ARCHISO" ]]; then
+    if grep -q '\bplymouth\b' "$MKINITCPIO_ARCHISO"; then
+        c_green "    plymouth hook already present."
+    else
+        sed -i -E 's/(HOOKS=\([^)]*\bbase\b[[:space:]]+\budev\b)/\1 plymouth/' "$MKINITCPIO_ARCHISO"
+        if grep -q '\bplymouth\b' "$MKINITCPIO_ARCHISO"; then
+            c_green "    plymouth hook inserted into $MKINITCPIO_ARCHISO"
+        else
+            c_red "    WARNING: could not locate 'base udev' in $MKINITCPIO_ARCHISO to insert"
+            c_red "    the plymouth hook. Splash may not appear; quiet boot params will still"
+            c_red "    hide most log text. Check this file manually if the splash is missing."
+        fi
+    fi
+else
+    c_red "    WARNING: $MKINITCPIO_ARCHISO not found — plymouth hook not inserted."
+    c_red "    Quiet boot params will still hide most log text even without the splash."
+fi
+
+# ---- 8. Autostart the wizard on tty1 (unconditional — no shell fallback) ---
 c_green "==> Configuring autostart on tty1..."
 mkdir -p "${AIROOTFS}/etc/systemd/system/getty@tty1.service.d"
 # NOTE: the 'EOF' delimiter here is QUOTED deliberately — this keeps $TERM
@@ -235,40 +303,54 @@ EOF
 
 mkdir -p "${AIROOTFS}/root"
 cat > "${AIROOTFS}/root/.bash_profile" <<'EOF'
-# Auto-launch the xyloOS installer wizard on first console login only.
-# Wrapped in a retry loop: if the wizard exits unexpectedly for any reason
-# (a bug, Ctrl+C, etc.) this explains what happened and offers to restart
-# it, instead of silently dropping to an unexplained shell prompt.
-if [[ -z "${XYLOOS_WIZARD_STARTED:-}" && "$(tty)" == "/dev/tty1" ]]; then
+# Auto-launch the xyloOS installer wizard on login.
+# This account exists solely to run the installer, so this launches
+# unconditionally rather than gating on a tty-string match (which is
+# fragile depending on exactly how the login was spawned, and previously
+# caused the wizard to silently fail to start on some hardware).
+if [[ -z "${XYLOOS_WIZARD_STARTED:-}" ]]; then
     export XYLOOS_WIZARD_STARTED=1
-    while true; do
-        /usr/local/bin/xylo-installer
-        rc=$?
-        if [[ $rc -eq 0 ]]; then
-            break
-        fi
+    clear
+    /usr/local/bin/xylo-installer
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
         echo
         echo "-------------------------------------------------------------"
         echo " The installer exited unexpectedly (exit code $rc)."
+        echo " Type 'xylo-installer' at any time to relaunch it."
         echo "-------------------------------------------------------------"
-        read -rp "Press Enter to restart the installer, or type 'shell' for a command line: " ans
-        if [[ "$ans" == "shell" ]]; then
-            echo "Type 'xylo-installer' at any time to relaunch the wizard."
-            break
-        fi
-    done
+    fi
 fi
 EOF
 
-# ---- 8. Substitute tokens into the overlaid GRUB config ---------------------
-c_green "==> Finalizing GRUB boot menu (background image + labels)..."
-GRUB_MAIN="${PROFILE_DIR}/grub/grub.cfg"
-if [[ -f "$GRUB_MAIN" ]]; then
-  sed -i "s#%INSTALL_DIR%#${INSTALL_DIR}#g; s#%ISO_LABEL%#${ISO_LABEL}#g" "$GRUB_MAIN"
-fi
-[[ -f "${PROFILE_DIR}/grub/splash.png" ]] || die "profile/grub/splash.png is missing."
+# ---- 9. Rebrand + hide the UEFI boot menu (systemd-boot) -------------------
+# This profile's actual UEFI boot mode is systemd-boot (see profiledef.sh
+# bootmodes), not GRUB — mkarchiso never reads profile/grub/grub.cfg for
+# UEFI at all. That file is left in place below purely as inert legacy
+# content; the real UEFI menu lives in efiboot/loader/ and is rewritten
+# here from scratch: single entry, zero "Arch" branding, zero-second
+# timeout so it boots straight in without waiting for a keypress.
+c_green "==> Rebranding + hiding the UEFI boot menu (systemd-boot)..."
+EFIBOOT_LOADER="${PROFILE_DIR}/efiboot/loader"
+mkdir -p "${EFIBOOT_LOADER}/entries"
+rm -f "${EFIBOOT_LOADER}"/entries/*.conf
 
-# ---- 9. syslinux (BIOS) boot menu --------------------------------------------
+cat > "${EFIBOOT_LOADER}/loader.conf" <<EOF
+default 01-xyloos-install.conf
+timeout 0
+console-mode max
+EOF
+
+cat > "${EFIBOOT_LOADER}/entries/01-xyloos-install.conf" <<EOF
+title   xyloOS Installer
+linux   /${INSTALL_DIR}/boot/x86_64/vmlinuz-linux
+initrd  /${INSTALL_DIR}/boot/intel-ucode.img
+initrd  /${INSTALL_DIR}/boot/amd-ucode.img
+initrd  /${INSTALL_DIR}/boot/x86_64/initramfs-linux.img
+options archisobasedir=${INSTALL_DIR} archisolabel=${ISO_LABEL} ${QUIET_PARAMS}
+EOF
+
+# ---- 10. syslinux (BIOS) boot menu -------------------------------------------
 c_green "==> Writing syslinux boot menu..."
 SYS_CFG="${PROFILE_DIR}/syslinux/archiso_sys.cfg"
 if [[ -f "$SYS_CFG" ]]; then
@@ -277,13 +359,13 @@ LABEL xyloos
     MENU LABEL Boot xyloOS Installer (Default)
     LINUX /${INSTALL_DIR}/boot/x86_64/vmlinuz-linux
     INITRD /${INSTALL_DIR}/boot/x86_64/initramfs-linux.img
-    APPEND archisobasedir=${INSTALL_DIR} archisolabel=${ISO_LABEL} quiet
+    APPEND archisobasedir=${INSTALL_DIR} archisolabel=${ISO_LABEL} ${QUIET_PARAMS}
 
 LABEL xyloos-safe
     MENU LABEL Boot xyloOS Installer (Safe Graphics / Nomodeset)
     LINUX /${INSTALL_DIR}/boot/x86_64/vmlinuz-linux
     INITRD /${INSTALL_DIR}/boot/x86_64/initramfs-linux.img
-    APPEND archisobasedir=${INSTALL_DIR} archisolabel=${ISO_LABEL} nomodeset quiet
+    APPEND archisobasedir=${INSTALL_DIR} archisolabel=${ISO_LABEL} nomodeset ${QUIET_PARAMS}
 
 LABEL reboot
     MENU LABEL Reboot
@@ -297,6 +379,8 @@ fi
 
 if [[ -f "${PROFILE_DIR}/syslinux/archiso_head.cfg" ]]; then
   sed -i "s/^MENU TITLE.*/MENU TITLE xyloOS Boot Menu/" "${PROFILE_DIR}/syslinux/archiso_head.cfg" || true
+  # Boot the default entry immediately instead of waiting on the menu.
+  sed -i -E 's/^(TIMEOUT).*/\1 1/' "${PROFILE_DIR}/syslinux/archiso_head.cfg" || true
 fi
 
 # Make sure the reboot/poweroff com32 modules are present in the profile
@@ -308,7 +392,7 @@ for mod in reboot.c32 poweroff.c32 libutil.c32; do
     done
 done
 
-# ---- 10. Build the ISO ---------------------------------------------------------
+# ---- 11. Build the ISO ---------------------------------------------------------
 c_green "==> Running mkarchiso (this will take a while and needs internet)..."
 mkarchiso -v -w "${WORKDIR}/mkarchiso-work" -o "$OUT_DIR" "$PROFILE_DIR"
 
@@ -316,7 +400,3 @@ c_green "==> Build complete:"
 ls -lh "$OUT_DIR"/*.iso
 c_green "Flash with Rufus using 'DD Image mode' (it will offer this automatically"
 c_green "for hybrid ISOs) for full BIOS + UEFI compatibility."
-c_green ""
-c_green "Recommended: test-boot the ISO in a VM (QEMU/VirtualBox) before writing"
-c_green "it to real hardware, since boot menu templates can vary slightly across"
-c_green "archiso versions."
