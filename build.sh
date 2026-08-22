@@ -16,16 +16,24 @@
 #   3. Overlays this kit's profile/ directory on top (motd, xylo-installer,
 #      splash.png — the files you can see and edit directly)
 #   4. Rebrands profiledef.sh, os-release, hostname, package list
-#   5. Rebrands and hides the UEFI boot menu (systemd-boot: this profile's
-#      actual UEFI boot mode — see profiledef.sh bootmodes) so it boots
-#      straight into xyloOS with zero "Arch" branding and no visible menu
-#   6. Sets up a Plymouth splash (using splash.png + a spinner) and quiet
-#      boot kernel params so the verbose systemd startup log is hidden
+#   5. Rebrands and hides both boot menus:
+#        - UEFI: rewrites efiboot/loader/ (systemd-boot) — this profile's
+#          real UEFI bootloader, see profiledef.sh bootmodes
+#        - BIOS: rewrites syslinux/archiso_sys-linux.cfg (the real boot
+#          entries file), while PRESERVING syslinux/archiso_sys.cfg's
+#          INCLUDE/DEFAULT structure — that structure is load-bearing;
+#          replacing it outright breaks the whole BIOS menu (learned the
+#          hard way — see CHANGELOG at the bottom of this file)
+#      Both boot straight into xyloOS with zero "Arch" branding, no
+#      visible menu, and a near-zero timeout.
+#   6. Sets up a Plymouth splash using the stock "spinner" theme with our
+#      logo dropped in as its watermark (the real, documented way to
+#      brand that theme — not a custom theme file) + quiet boot params,
+#      so the verbose systemd startup log is hidden
 #   7. Adds the black dialog theme and autostarts xylo-installer on tty1
 #      unconditionally (no fragile tty-matching — this medium's root
 #      account exists only to run the installer)
-#   8. Writes a clean 4-item syslinux (BIOS) boot menu
-#   9. Runs mkarchiso to produce the final .iso
+#   8. Runs mkarchiso to produce the final .iso
 #
 # Usage:
 #   sudo ./build.sh
@@ -47,7 +55,10 @@ ISO_APPLICATION="xyloOS Live/Installer"
 INSTALL_DIR="xyloos"
 # Kernel params shared by both boot paths (UEFI systemd-boot + BIOS syslinux)
 # to hide the verbose systemd startup log behind the Plymouth splash.
-QUIET_PARAMS="quiet splash loglevel=3 systemd.show_status=false rd.udev.log_level=3 vt.global_cursor_default=0"
+# Deliberately NOT including systemd.show_status=false: if Plymouth doesn't
+# render for any reason, this keeps systemd's own boot status text visible
+# as a fallback instead of a blank/black screen with zero information.
+QUIET_PARAMS="quiet splash loglevel=3"
 
 c_green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 c_red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
@@ -229,46 +240,31 @@ searchbox_border2_color = dialog_color
 menubox_border2_color = dialog_color
 EOF
 
-# ---- 7. Plymouth boot splash (logo + spinner, replaces verbose boot text) --
-# Best-effort: this could not be tested against a live Arch/plymouth
-# environment. If the splash doesn't render right, boot still proceeds
-# normally (quiet kernel params alone already hide most of the log text) —
-# this is the single most likely spot to need another CI-iteration fix.
-c_green "==> Installing Plymouth splash theme..."
+# ---- 7. Plymouth boot splash (spinner theme + our logo as its watermark) --
+# IMPORTANT: earlier versions of this kit tried a custom .plymouth theme
+# with a "WatermarkImage=" key — that key does not exist and was silently
+# ignored, so the logo never actually appeared. The real, ArchWiki-
+# documented mechanism for branding the stock "spinner" theme (which ships
+# with the plymouth package) is to drop a file literally named
+# watermark.png directly into that theme's own directory. Since
+# profile/airootfs/ is overlaid on top of the package-installed root, a
+# file placed here at build time correctly lands in the live image.
+c_green "==> Installing Plymouth splash (branding the stock spinner theme)..."
 [[ -f "${PROFILE_DIR}/grub/splash.png" ]] || die "profile/grub/splash.png is missing."
-PLY_THEME_DIR="${AIROOTFS}/usr/share/plymouth/themes/xyloos"
-mkdir -p "$PLY_THEME_DIR"
-cp "${PROFILE_DIR}/grub/splash.png" "${PLY_THEME_DIR}/splash.png"
+mkdir -p "${AIROOTFS}/usr/share/plymouth/themes/spinner"
+cp "${PROFILE_DIR}/grub/splash.png" "${AIROOTFS}/usr/share/plymouth/themes/spinner/watermark.png"
 
-cat > "${PLY_THEME_DIR}/xyloos.plymouth" <<'EOF'
-[Plymouth Theme]
-Name=xyloOS
-Description=xyloOS boot splash
-ModuleName=two-step
-
-[two-step]
-ImageDir=/usr/share/plymouth/themes/spinner
-WatermarkImage=/usr/share/plymouth/themes/xyloos/splash.png
-WatermarkHorizontalAlignment=.5
-WatermarkVerticalAlignment=.4
-HorizontalAlignment=.5
-VerticalAlignment=.75
-Transition=none
-TransitionDuration=0.0
-BackgroundStartColor=0x000000
-BackgroundEndColor=0x000000
-EOF
-
-# Set it as the default theme + bake it into the live initramfs.
 mkdir -p "${AIROOTFS}/etc/plymouth"
 cat > "${AIROOTFS}/etc/plymouth/plymouthd.conf" <<'EOF'
 [Daemon]
-Theme=xyloos
+Theme=spinner
 EOF
 
 # Insert the plymouth hook into the live-environment mkinitcpio config
 # right after "base udev" (preserving whatever else releng already has
 # there, rather than guessing the full HOOKS line and overwriting it).
+# Verified against the real releng airootfs/etc/mkinitcpio.conf.d/archiso.conf —
+# "base udev" appear adjacent at the start of the HOOKS array there.
 MKINITCPIO_ARCHISO="${AIROOTFS}/etc/mkinitcpio.conf.d/archiso.conf"
 if [[ -f "$MKINITCPIO_ARCHISO" ]]; then
     if grep -q '\bplymouth\b' "$MKINITCPIO_ARCHISO"; then
@@ -327,45 +323,64 @@ EOF
 # This profile's actual UEFI boot mode is systemd-boot (see profiledef.sh
 # bootmodes), not GRUB — mkarchiso never reads profile/grub/grub.cfg for
 # UEFI at all. That file is left in place below purely as inert legacy
-# content; the real UEFI menu lives in efiboot/loader/ and is rewritten
-# here from scratch: single entry, zero "Arch" branding, zero-second
-# timeout so it boots straight in without waiting for a keypress.
+# content; the real UEFI menu lives in efiboot/loader/.
+#
+# The entry below matches the real upstream releng entry's structure
+# exactly (verified against archlinux/archiso's actual source) — same
+# %ARCH%/%INSTALL_DIR%/%ARCHISO_UUID% tokens that mkarchiso substitutes
+# automatically, and critically NO separate ucode initrd lines: an
+# earlier version of this kit added initrd lines for intel-ucode.img/
+# amd-ucode.img that don't exist as separate files in the real boot
+# layout (microcode is folded into the main initramfs already) — those
+# bogus references are the most likely cause of a blank screen on boot.
 c_green "==> Rebranding + hiding the UEFI boot menu (systemd-boot)..."
 EFIBOOT_LOADER="${PROFILE_DIR}/efiboot/loader"
 mkdir -p "${EFIBOOT_LOADER}/entries"
 rm -f "${EFIBOOT_LOADER}"/entries/*.conf
 
-cat > "${EFIBOOT_LOADER}/loader.conf" <<EOF
-default 01-xyloos-install.conf
+cat > "${EFIBOOT_LOADER}/loader.conf" <<'EOF'
 timeout 0
+default 01-xyloos-install.conf
 console-mode max
 EOF
 
 cat > "${EFIBOOT_LOADER}/entries/01-xyloos-install.conf" <<EOF
-title   xyloOS Installer
-linux   /${INSTALL_DIR}/boot/x86_64/vmlinuz-linux
-initrd  /${INSTALL_DIR}/boot/intel-ucode.img
-initrd  /${INSTALL_DIR}/boot/amd-ucode.img
-initrd  /${INSTALL_DIR}/boot/x86_64/initramfs-linux.img
-options archisobasedir=${INSTALL_DIR} archisolabel=${ISO_LABEL} ${QUIET_PARAMS}
+title    xyloOS Installer
+sort-key 01
+linux    /%INSTALL_DIR%/boot/%ARCH%/vmlinuz-linux
+initrd   /%INSTALL_DIR%/boot/%ARCH%/initramfs-linux.img
+options  archisobasedir=%INSTALL_DIR% archisosearchuuid=%ARCHISO_UUID% ${QUIET_PARAMS}
 EOF
 
-# ---- 10. syslinux (BIOS) boot menu -------------------------------------------
-c_green "==> Writing syslinux boot menu..."
-SYS_CFG="${PROFILE_DIR}/syslinux/archiso_sys.cfg"
-if [[ -f "$SYS_CFG" ]]; then
-cat > "$SYS_CFG" <<EOF
-LABEL xyloos
-    MENU LABEL Boot xyloOS Installer (Default)
-    LINUX /${INSTALL_DIR}/boot/x86_64/vmlinuz-linux
-    INITRD /${INSTALL_DIR}/boot/x86_64/initramfs-linux.img
-    APPEND archisobasedir=${INSTALL_DIR} archisolabel=${ISO_LABEL} ${QUIET_PARAMS}
+# ---- 10. Rebrand + hide the BIOS boot menu (syslinux) ----------------------
+# CRITICAL STRUCTURE NOTE (learned from a real broken build): the boot
+# chain for local media is syslinux.cfg -> archiso_sys.cfg -> [INCLUDE
+# archiso_head.cfg (menu system/UI), DEFAULT + TIMEOUT, INCLUDE
+# archiso_sys-linux.cfg (the actual boot entries)]. An earlier version of
+# this kit fully overwrote archiso_sys.cfg with a flat entry list, which
+# silently deleted the INCLUDE archiso_head.cfg line (where "UI
+# vesamenu.c32" lives) and the DEFAULT directive — producing exactly the
+# ISOLINUX error "No DEFAULT or UI configuration directive found!" at
+# boot. The fix below preserves that structure and puts our custom
+# entries in archiso_sys-linux.cfg, which is the file actually meant for
+# them (verified against archlinux/archiso's real source).
+c_green "==> Rebranding + hiding the BIOS boot menu (syslinux)..."
+SYSLINUX_DIR="${PROFILE_DIR}/syslinux"
 
-LABEL xyloos-safe
-    MENU LABEL Boot xyloOS Installer (Safe Graphics / Nomodeset)
-    LINUX /${INSTALL_DIR}/boot/x86_64/vmlinuz-linux
-    INITRD /${INSTALL_DIR}/boot/x86_64/initramfs-linux.img
-    APPEND archisobasedir=${INSTALL_DIR} archisolabel=${ISO_LABEL} nomodeset ${QUIET_PARAMS}
+if [[ -f "${SYSLINUX_DIR}/archiso_head.cfg" ]]; then
+  sed -i "s/^MENU TITLE.*/MENU TITLE xyloOS Boot Menu/" "${SYSLINUX_DIR}/archiso_head.cfg" || true
+fi
+# Use our own logo for the BIOS menu background too (MENU BACKGROUND in
+# archiso_head.cfg is a relative reference to a file in this directory).
+cp "${PROFILE_DIR}/grub/splash.png" "${SYSLINUX_DIR}/splash.png" 2>/dev/null || true
+
+cat > "${SYSLINUX_DIR}/archiso_sys.cfg" <<'EOF'
+INCLUDE archiso_head.cfg
+
+DEFAULT xyloos
+TIMEOUT 1
+
+INCLUDE archiso_sys-linux.cfg
 
 LABEL reboot
     MENU LABEL Reboot
@@ -375,19 +390,26 @@ LABEL poweroff
     MENU LABEL Power Off
     COM32 poweroff.c32
 EOF
-fi
 
-if [[ -f "${PROFILE_DIR}/syslinux/archiso_head.cfg" ]]; then
-  sed -i "s/^MENU TITLE.*/MENU TITLE xyloOS Boot Menu/" "${PROFILE_DIR}/syslinux/archiso_head.cfg" || true
-  # Boot the default entry immediately instead of waiting on the menu.
-  sed -i -E 's/^(TIMEOUT).*/\1 1/' "${PROFILE_DIR}/syslinux/archiso_head.cfg" || true
-fi
+cat > "${SYSLINUX_DIR}/archiso_sys-linux.cfg" <<EOF
+LABEL xyloos
+MENU LABEL Boot xyloOS Installer (Default)
+LINUX /%INSTALL_DIR%/boot/%ARCH%/vmlinuz-linux
+INITRD /%INSTALL_DIR%/boot/%ARCH%/initramfs-linux.img
+APPEND archisobasedir=%INSTALL_DIR% archisosearchuuid=%ARCHISO_UUID% ${QUIET_PARAMS}
+
+LABEL xyloos-safe
+MENU LABEL Boot xyloOS Installer (Safe Graphics / Nomodeset)
+LINUX /%INSTALL_DIR%/boot/%ARCH%/vmlinuz-linux
+INITRD /%INSTALL_DIR%/boot/%ARCH%/initramfs-linux.img
+APPEND archisobasedir=%INSTALL_DIR% archisosearchuuid=%ARCHISO_UUID% nomodeset ${QUIET_PARAMS}
+EOF
 
 # Make sure the reboot/poweroff com32 modules are present in the profile
 for mod in reboot.c32 poweroff.c32 libutil.c32; do
     for src in "/usr/lib/syslinux/bios/${mod}" "/usr/lib/syslinux/${mod}"; do
-        if [[ -f "$src" && -d "${PROFILE_DIR}/syslinux" ]]; then
-            cp -n "$src" "${PROFILE_DIR}/syslinux/" 2>/dev/null || true
+        if [[ -f "$src" && -d "$SYSLINUX_DIR" ]]; then
+            cp -n "$src" "${SYSLINUX_DIR}/" 2>/dev/null || true
         fi
     done
 done
@@ -400,3 +422,16 @@ c_green "==> Build complete:"
 ls -lh "$OUT_DIR"/*.iso
 c_green "Flash with Rufus using 'DD Image mode' (it will offer this automatically"
 c_green "for hybrid ISOs) for full BIOS + UEFI compatibility."
+
+# ---------------------------------------------------------------------------
+# CHANGELOG (kept here so future edits don't reintroduce fixed bugs)
+# ---------------------------------------------------------------------------
+# - dwm removed from the live-ISO package list (not in official repos;
+#   built from source at install time instead by xylo-installer)
+# - BIOS boot menu: archiso_sys.cfg's INCLUDE/DEFAULT structure must be
+#   preserved, not overwritten wholesale — see step 10 above
+# - UEFI boot menu: no separate ucode initrd lines; use the same
+#   %ARCH%/%INSTALL_DIR%/%ARCHISO_UUID% tokens the real releng entries use
+# - Plymouth: brand the stock "spinner" theme by dropping a file named
+#   watermark.png into its own theme directory — there is no
+#   "WatermarkImage=" config key
