@@ -26,9 +26,8 @@
 #          hard way — see CHANGELOG at the bottom of this file)
 #      Both boot straight into xyloOS with zero "Arch" branding, no
 #      visible menu, and a near-zero timeout.
-#   6. Sets up a Plymouth splash using the stock "spinner" theme with our
-#      logo dropped in as its watermark (the real, documented way to
-#      brand that theme — not a custom theme file) + quiet boot params,
+#   6. Sets up a Plymouth splash using the stock "spinner" theme (unbranded
+#      for now — see CHANGELOG at the bottom for why) + quiet boot params,
 #      so the verbose systemd startup log is hidden
 #   7. Adds the black dialog theme and autostarts xylo-installer on tty1
 #      unconditionally (no fragile tty-matching — this medium's root
@@ -240,20 +239,19 @@ searchbox_border2_color = dialog_color
 menubox_border2_color = dialog_color
 EOF
 
-# ---- 7. Plymouth boot splash (spinner theme + our logo as its watermark) --
-# IMPORTANT: earlier versions of this kit tried a custom .plymouth theme
-# with a "WatermarkImage=" key — that key does not exist and was silently
-# ignored, so the logo never actually appeared. The real, ArchWiki-
-# documented mechanism for branding the stock "spinner" theme (which ships
-# with the plymouth package) is to drop a file literally named
-# watermark.png directly into that theme's own directory. Since
-# profile/airootfs/ is overlaid on top of the package-installed root, a
-# file placed here at build time correctly lands in the live image.
-c_green "==> Installing Plymouth splash (branding the stock spinner theme)..."
-[[ -f "${PROFILE_DIR}/grub/splash.png" ]] || die "profile/grub/splash.png is missing."
-mkdir -p "${AIROOTFS}/usr/share/plymouth/themes/spinner"
-cp "${PROFILE_DIR}/grub/splash.png" "${AIROOTFS}/usr/share/plymouth/themes/spinner/watermark.png"
-
+# ---- 7. Plymouth boot splash (stock spinner theme, quiet+splash boot) -----
+# NOTE: an earlier version of this kit tried to brand the stock "spinner"
+# theme by dropping our logo in as its watermark.png. That path is real
+# and correctly documented (confirmed: the plymouth package itself ships
+# a file at that exact path) — but archiso copies the airootfs overlay
+# BEFORE pacstrap installs packages (confirmed against the real archiso
+# docs), so our pre-placed file collided with the package's own file and
+# broke pacstrap entirely ("failed to commit transaction, conflicting
+# files"). Rather than fight package-install ordering, this uses the
+# stock spinner splash unbranded for now — quiet boot + a spinner instead
+# of a wall of text, without risking the whole build. Custom-branding the
+# splash is a good follow-up once the core experience is confirmed working.
+c_green "==> Installing Plymouth splash (stock spinner theme)..."
 mkdir -p "${AIROOTFS}/etc/plymouth"
 cat > "${AIROOTFS}/etc/plymouth/plymouthd.conf" <<'EOF'
 [Daemon]
@@ -432,6 +430,9 @@ c_green "for hybrid ISOs) for full BIOS + UEFI compatibility."
 #   preserved, not overwritten wholesale — see step 10 above
 # - UEFI boot menu: no separate ucode initrd lines; use the same
 #   %ARCH%/%INSTALL_DIR%/%ARCHISO_UUID% tokens the real releng entries use
-# - Plymouth: brand the stock "spinner" theme by dropping a file named
-#   watermark.png into its own theme directory — there is no
-#   "WatermarkImage=" config key
+# - Plymouth: airootfs is overlaid BEFORE pacstrap runs (confirmed in
+#   archiso's own docs), so pre-placing a file at a path the plymouth
+#   package also ships (spinner theme's watermark.png) breaks pacstrap
+#   with a file-conflict error. Using the stock spinner theme unbranded
+#   avoids this; branding it needs a post-install step, not an airootfs
+#   overlay file, and is a good separate follow-up later.
