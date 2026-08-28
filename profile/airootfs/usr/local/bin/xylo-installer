@@ -565,7 +565,7 @@ step_install() {
     # shellcheck disable=SC2086
     pacstrap -K /mnt base linux linux-firmware sudo networkmanager iwd \
         grub efibootmgr os-prober vim nano dialog fastfetch \
-        mesa vulkan-icd-loader plymouth \
+        mesa vulkan-icd-loader \
         $DE_PKGS \
         || die "pacstrap failed. Check network connectivity and retry."
 
@@ -626,25 +626,16 @@ if [[ "${BUILD_DWM_FROM_SOURCE}" == "1" ]]; then
     cd /
 fi
 
-# Plymouth splash for the installed system (mirrors the live-ISO setup,
-# using the stock spinner theme, unbranded — see build.sh's CHANGELOG for
-# why a custom watermark isn't used yet). Arch's default GRUB config boots
-# "quiet" already; without a splash installed to show in its place, that
-# meant a genuinely blank screen with zero feedback on every boot.
-mkdir -p /etc/plymouth
-cat > /etc/plymouth/plymouthd.conf <<'PLYEOF'
-[Daemon]
-Theme=spinner
-PLYEOF
-if grep -q '\bplymouth\b' /etc/mkinitcpio.conf; then
-    :
-else
-    sed -i -E 's/(HOOKS=\([^)]*\bbase\b[[:space:]]+\budev\b)/\1 plymouth/' /etc/mkinitcpio.conf
-fi
+# No Plymouth splash on the installed system either — same Arch-branding
+# risk applies here as on the live ISO (see build.sh's CHANGELOG). Arch's
+# default GRUB config boots "quiet" out of the box; without a splash to
+# show in its place that means a genuinely blank screen with zero
+# feedback, so this explicitly drops "quiet" here to keep boot text
+# visible instead.
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
-    sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet splash"/' /etc/default/grub
+    sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3"/' /etc/default/grub
 else
-    echo 'GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet splash"' >> /etc/default/grub
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3"' >> /etc/default/grub
 fi
 
 mkinitcpio -P
