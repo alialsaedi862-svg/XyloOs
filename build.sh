@@ -57,7 +57,7 @@ INSTALL_DIR="xyloos"
 # Deliberately NOT including systemd.show_status=false: if Plymouth doesn't
 # render for any reason, this keeps systemd's own boot status text visible
 # as a fallback instead of a blank/black screen with zero information.
-QUIET_PARAMS="quiet splash loglevel=3"
+QUIET_PARAMS="quiet loglevel=3"
 
 c_green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 c_red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
@@ -122,7 +122,6 @@ efibootmgr
 os-prober
 reflector
 fastfetch
-plymouth
 gnome-shell
 gnome-control-center
 nautilus
@@ -239,48 +238,17 @@ searchbox_border2_color = dialog_color
 menubox_border2_color = dialog_color
 EOF
 
-# ---- 7. Plymouth boot splash (stock spinner theme, quiet+splash boot) -----
-# NOTE: an earlier version of this kit tried to brand the stock "spinner"
-# theme by dropping our logo in as its watermark.png. That path is real
-# and correctly documented (confirmed: the plymouth package itself ships
-# a file at that exact path) — but archiso copies the airootfs overlay
-# BEFORE pacstrap installs packages (confirmed against the real archiso
-# docs), so our pre-placed file collided with the package's own file and
-# broke pacstrap entirely ("failed to commit transaction, conflicting
-# files"). Rather than fight package-install ordering, this uses the
-# stock spinner splash unbranded for now — quiet boot + a spinner instead
-# of a wall of text, without risking the whole build. Custom-branding the
-# splash is a good follow-up once the core experience is confirmed working.
-c_green "==> Installing Plymouth splash (stock spinner theme)..."
-mkdir -p "${AIROOTFS}/etc/plymouth"
-cat > "${AIROOTFS}/etc/plymouth/plymouthd.conf" <<'EOF'
-[Daemon]
-Theme=spinner
-EOF
-
-# Insert the plymouth hook into the live-environment mkinitcpio config
-# right after "base udev" (preserving whatever else releng already has
-# there, rather than guessing the full HOOKS line and overwriting it).
-# Verified against the real releng airootfs/etc/mkinitcpio.conf.d/archiso.conf —
-# "base udev" appear adjacent at the start of the HOOKS array there.
-MKINITCPIO_ARCHISO="${AIROOTFS}/etc/mkinitcpio.conf.d/archiso.conf"
-if [[ -f "$MKINITCPIO_ARCHISO" ]]; then
-    if grep -q '\bplymouth\b' "$MKINITCPIO_ARCHISO"; then
-        c_green "    plymouth hook already present."
-    else
-        sed -i -E 's/(HOOKS=\([^)]*\bbase\b[[:space:]]+\budev\b)/\1 plymouth/' "$MKINITCPIO_ARCHISO"
-        if grep -q '\bplymouth\b' "$MKINITCPIO_ARCHISO"; then
-            c_green "    plymouth hook inserted into $MKINITCPIO_ARCHISO"
-        else
-            c_red "    WARNING: could not locate 'base udev' in $MKINITCPIO_ARCHISO to insert"
-            c_red "    the plymouth hook. Splash may not appear; quiet boot params will still"
-            c_red "    hide most log text. Check this file manually if the splash is missing."
-        fi
-    fi
-else
-    c_red "    WARNING: $MKINITCPIO_ARCHISO not found — plymouth hook not inserted."
-    c_red "    Quiet boot params will still hide most log text even without the splash."
-fi
+# ---- 7. No Plymouth splash (disabled — see CHANGELOG at the bottom) -------
+# Plymouth has caused repeated, hard-to-verify problems across several
+# rounds (a pacman file conflict, then — confirmed via boot test — showing
+# Arch's own bundled fallback logo instead of our config's chosen theme).
+# Given zero Arch branding anywhere is a hard requirement, disabling the
+# splash entirely is the only way to *guarantee* no logo can appear, so
+# that's what this does for now. Boot is plain "quiet" (readable text, no
+# graphical splash) instead. A properly branded splash is worth revisiting
+# later as its own isolated piece, once it can be done with much tighter
+# verification than trial-and-error against a live boot each time.
+c_green "==> Skipping Plymouth splash (disabled — see build.sh CHANGELOG)."
 
 # ---- 8. Autostart the wizard on tty1 (unconditional — no shell fallback) ---
 c_green "==> Configuring autostart on tty1..."
@@ -433,6 +401,14 @@ c_green "for hybrid ISOs) for full BIOS + UEFI compatibility."
 # - Plymouth: airootfs is overlaid BEFORE pacstrap runs (confirmed in
 #   archiso's own docs), so pre-placing a file at a path the plymouth
 #   package also ships (spinner theme's watermark.png) breaks pacstrap
-#   with a file-conflict error. Using the stock spinner theme unbranded
-#   avoids this; branding it needs a post-install step, not an airootfs
-#   overlay file, and is a good separate follow-up later.
+#   with a file-conflict error.
+# - Plymouth, take 2: switched to the unbranded stock "spinner" theme via
+#   plymouthd.conf to sidestep the conflict above. On a real boot this
+#   showed ARCH'S OWN logo instead — Arch's plymouth package defaults to
+#   theme "bgrt", which falls back to a bundled Arch-branded image when no
+#   vendor boot logo is found in firmware; the plymouthd.conf override did
+#   not take effect early enough to prevent this. Given zero Arch branding
+#   is a hard requirement, Plymouth is disabled entirely for now (plain
+#   quiet boot, no splash) rather than keep iterating blind on this one
+#   piece — a properly branded splash is a good separate follow-up later,
+#   done with tighter verification than trial-and-error on live boots.
