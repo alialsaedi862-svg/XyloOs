@@ -363,29 +363,30 @@ step_user() {
 step_de() {
     banner "STEP 5: Desktop Environment / Window Manager"
 
-    local choice=""
-    choice=$(menu_pick "Desktop Environment / Window Manager" \
-        "Use Up/Down arrows and Enter to select:" 23 66 16 \
-        "gnome"      "GNOME (GDM)" \
-        "kde"        "KDE Plasma (SDDM)" \
-        "xfce"       "Xfce (LightDM)" \
-        "mate"       "MATE (LightDM)" \
-        "cinnamon"   "Cinnamon (LightDM)" \
-        "lxqt"       "LXQt (SDDM)" \
-        "lxde"       "LXDE (LightDM)" \
-        "budgie"     "Budgie (LightDM)" \
-        "hyprland"   "Hyprland (Wayland tiling WM)" \
-        "sway"       "Sway (Wayland tiling WM)" \
-        "i3"         "i3 (X11 tiling WM)" \
-        "bspwm"      "bspwm (X11 tiling WM)" \
-        "awesome"    "Awesome (X11 tiling WM)" \
-        "xmonad"     "Xmonad (X11 tiling WM)" \
-        "herbstluftwm" "herbstluftwm (X11 tiling WM)" \
-        "dwm"        "dwm (X11 tiling WM)" \
-        "none"       "Minimal CLI Only (no desktop)")
+    local choice="" attempts=0
+    while true; do
+        choice=$(menu_pick "Desktop Environment / Window Manager" \
+            "Use Up/Down arrows and Enter to select:" 23 66 16 \
+            "gnome"      "GNOME (GDM)" \
+            "kde"        "KDE Plasma (SDDM)" \
+            "xfce"       "Xfce (LightDM)" \
+            "mate"       "MATE (LightDM)" \
+            "cinnamon"   "Cinnamon (LightDM)" \
+            "lxqt"       "LXQt (SDDM)" \
+            "lxde"       "LXDE (LightDM)" \
+            "budgie"     "Budgie (LightDM)" \
+            "hyprland"   "Hyprland (Wayland tiling WM)" \
+            "sway"       "Sway (Wayland tiling WM)" \
+            "i3"         "i3 (X11 tiling WM)" \
+            "bspwm"      "bspwm (X11 tiling WM)" \
+            "awesome"    "Awesome (X11 tiling WM)" \
+            "xmonad"     "Xmonad (X11 tiling WM)" \
+            "herbstluftwm" "herbstluftwm (X11 tiling WM)" \
+            "dwm"        "dwm (X11 tiling WM)" \
+            "none"       "Minimal CLI Only (no desktop)")
 
-    if [[ -z "$choice" && $HAVE_DIALOG -ne 1 ]]; then
-        cat <<'MENU'
+        if [[ -z "$choice" && $HAVE_DIALOG -ne 1 ]]; then
+            cat <<'MENU'
   [1]  GNOME            [2]  KDE Plasma       [3]  Xfce
   [4]  MATE             [5]  Cinnamon         [6]  LXQt
   [7]  LXDE             [8]  Budgie           [9]  Hyprland
@@ -393,11 +394,25 @@ step_de() {
   [13] Awesome          [14] Xmonad           [15] herbstluftwm
   [16] dwm              [17] Minimal CLI Only
 MENU
-        local n
-        read -rp "Choose [1-17]: " n
-        local names=(gnome kde xfce mate cinnamon lxqt lxde budgie hyprland sway i3 bspwm awesome xmonad herbstluftwm dwm none)
-        choice="${names[$((n-1))]:-}"
-    fi
+            local n
+            read -rp "Choose [1-17]: " n
+            local names=(gnome kde xfce mate cinnamon lxqt lxde budgie hyprland sway i3 bspwm awesome xmonad herbstluftwm dwm none)
+            choice="${names[$((n-1))]:-}"
+        fi
+
+        case "$choice" in
+            gnome|kde|xfce|mate|cinnamon|lxqt|lxde|budgie|hyprland|sway|i3|bspwm|awesome|xmonad|herbstluftwm|dwm|none|"")
+                break
+                ;;
+            *)
+                ((attempts++))
+                if [[ $attempts -ge 3 ]]; then
+                    die "Unrecognized desktop selection: '${choice}' after ${attempts} attempts (this points to a real bug, tell Claude the exact text after the colon)."
+                fi
+                warn "Unrecognized selection: '${choice}'. Please try again (attempt ${attempts}/3)."
+                ;;
+        esac
+    done
 
     # DE_MODE: "dm" (has a display manager) / "wm-x11" / "wm-wayland" / "none"
     DE_MODE="dm"
@@ -452,7 +467,6 @@ MENU
             BUILD_DWM_FROM_SOURCE=1
             ;;
         none|"") DE_MODE="none"; DE_PKGS=""; DE_SERVICE=""; DE_LABEL="Minimal CLI Only" ;;
-        *) die "Invalid selection." ;;
     esac
     ok "Desktop selection: $DE_LABEL"
 }
@@ -493,15 +507,23 @@ step_disk() {
     fi
     [[ ${#menu_items[@]} -gt 0 ]] || die "No installable drives found (only the boot USB was detected)."
 
-    TARGET_DISK=""
-    if [[ $HAVE_DIALOG -eq 1 ]]; then
-        TARGET_DISK=$(dialog --clear --backtitle "xyloOS Installer" \
-            --title "Select Target Drive" \
-            --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
-            18 60 8 "${menu_items[@]}" 3>&1 1>&2 2>&3)
-        clear
-    fi
-    [[ -n "$TARGET_DISK" ]] || die "Invalid selection."
+    local attempts=0
+    while true; do
+        TARGET_DISK=""
+        if [[ $HAVE_DIALOG -eq 1 ]]; then
+            TARGET_DISK=$(dialog --clear --backtitle "xyloOS Installer" \
+                --title "Select Target Drive" \
+                --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
+                18 60 8 "${menu_items[@]}" 3>&1 1>&2 2>&3)
+            clear
+        fi
+        [[ -n "$TARGET_DISK" ]] && break
+        ((attempts++))
+        if [[ $attempts -ge 3 ]]; then
+            die "No drive was selected after ${attempts} attempts (dialog kept returning empty — if you were pressing Cancel/Esc, that's why; otherwise this points to a real bug, tell Claude)."
+        fi
+        warn "No drive selected. Please try again (attempt ${attempts}/3)."
+    done
 
     if ! confirm "ALL DATA ON $TARGET_DISK WILL BE PERMANENTLY ERASED.\n\nErase $TARGET_DISK and continue?"; then
         die "Cancelled — nothing was erased."
@@ -729,43 +751,4 @@ main() {
                     ....@@@+.@@@@@        @@@@@#@@......                
                      ......@@@@=.=@@@@@@@@@@@@@.......                  
                        ........*@@@@@@@@@@@.........                    
-                          .......................                       
-                              ................                          
-
-                     xyloOS Installation Wizard
-BANNER
-    sleep 1
-
-    step_lang
-
-    while ! step_wifi; do
-        echo
-        warn "Wi-Fi setup did not complete."
-        if confirm "Try Wi-Fi setup again?"; then
-            continue
-        else
-            warn "Continuing without confirmed internet access."
-            warn "The install step later on needs internet to fetch packages,"
-            warn "so make sure you have a wired connection before proceeding."
-            break
-        fi
-    done
-    step_timezone
-    step_user
-    step_de
-    step_disk
-
-    banner "Ready to Install"
-    if ! confirm "Language      : $LANG_LABEL\nTimezone      : $TIMEZONE\nUsername      : $XYLO_USER\nDesktop       : $DE_LABEL\nTarget drive  : $TARGET_DISK\n\nTHIS ERASES $TARGET_DISK.\n\nProceed with installation?"; then
-        die "Installation cancelled by user."
-    fi
-
-    step_install
-
-    echo
-    if confirm "Installation finished. Reboot now?"; then
-        reboot
-    fi
-}
-
-main "$@"
+                          .
