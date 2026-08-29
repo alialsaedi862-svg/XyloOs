@@ -96,6 +96,26 @@ sed -i \
   -e "s#^install_dir=.*#install_dir=\"${INSTALL_DIR}\"#" \
   "${PROFILE_DIR}/profiledef.sh"
 
+# Register xylo-installer's executable bit explicitly. Verified against
+# real releng's own profiledef.sh: it lists its own custom airootfs
+# scripts (choose-mirror, livecd-sound, etc.) in file_permissions the
+# same way — mkarchiso treats this array as authoritative for the final
+# image rather than trusting whatever chmod was applied during staging,
+# which is exactly why xylo-installer was silently non-executable
+# ("permission denied") despite being chmod +x'd earlier in this script.
+sed -i '/^file_permissions=(/a\  ["/usr/local/bin/xylo-installer"]="0:0:755"' "${PROFILE_DIR}/profiledef.sh"
+
+# Force root's login shell to bash. The releng skeleton (via
+# grml-zsh-config in the base package set) defaults root's shell to zsh
+# on the live medium — but /root/.bash_profile (our whole auto-launch
+# mechanism) is bash-specific and is never sourced by a zsh login at all,
+# which is why the installer never launched with zero error output: the
+# file containing both the launch call AND its own error handling was
+# simply never being read.
+if [[ -f "${PROFILE_DIR}/airootfs/etc/passwd" ]]; then
+    sed -i -E 's|^(root:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:).*|\1/bin/bash|' "${PROFILE_DIR}/airootfs/etc/passwd"
+fi
+
 # ---- 4. Package list additions ----------------------------------------------
 # This is the full set needed across all 17 DE/WM options in xylo-installer,
 # plus core installer tooling and plymouth (boot splash). xylo-installer
