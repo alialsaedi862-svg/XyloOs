@@ -751,4 +751,43 @@ main() {
                     ....@@@+.@@@@@        @@@@@#@@......                
                      ......@@@@=.=@@@@@@@@@@@@@.......                  
                        ........*@@@@@@@@@@@.........                    
-                          .
+                          .......................                       
+                              ................                          
+
+                     xyloOS Installation Wizard
+BANNER
+    sleep 1
+
+    step_lang
+
+    while ! step_wifi; do
+        echo
+        warn "Wi-Fi setup did not complete."
+        if confirm "Try Wi-Fi setup again?"; then
+            continue
+        else
+            warn "Continuing without confirmed internet access."
+            warn "The install step later on needs internet to fetch packages,"
+            warn "so make sure you have a wired connection before proceeding."
+            break
+        fi
+    done
+    step_timezone
+    step_user
+    step_de
+    step_disk
+
+    banner "Ready to Install"
+    if ! confirm "Language      : $LANG_LABEL\nTimezone      : $TIMEZONE\nUsername      : $XYLO_USER\nDesktop       : $DE_LABEL\nTarget drive  : $TARGET_DISK\n\nTHIS ERASES $TARGET_DISK.\n\nProceed with installation?"; then
+        die "Installation cancelled by user."
+    fi
+
+    step_install
+
+    echo
+    if confirm "Installation finished. Reboot now?"; then
+        reboot
+    fi
+}
+
+main "$@"
