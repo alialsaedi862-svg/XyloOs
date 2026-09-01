@@ -185,6 +185,16 @@ xmonad-contrib
 herbstluftwm
 EOF
 sort -u -o "${PROFILE_DIR}/packages.x86_64" "${PROFILE_DIR}/packages.x86_64"
+
+# Strip packages that are part of the stock releng skeleton (not ours)
+# but have gone missing from the official repos over time — Arch is
+# rolling-release with no version pinning here, so this list may need
+# to grow again later if mkarchiso reports another "target not found".
+# broadcom-wl (legacy Broadcom WiFi driver): confirmed unavailable as of
+# this build.
+for stale_pkg in broadcom-wl; do
+    sed -i "/^${stale_pkg}\$/d" "${PROFILE_DIR}/packages.x86_64"
+done
 c_red "NOTE: this package list was written from best available knowledge of"
 c_red "Arch's official repos, not verified live against a pacman database (no"
 c_red "Arch mirror access where this kit was authored). If mkarchiso below"
