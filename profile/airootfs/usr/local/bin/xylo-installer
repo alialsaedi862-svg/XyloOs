@@ -428,9 +428,9 @@ MENU
             *)
                 ((attempts++))
                 if [[ $attempts -ge 3 ]]; then
-                    die "Unrecognized desktop selection: '${choice}' after ${attempts} attempts (this points to a real bug, tell Claude the exact text after the colon)."
+                    die "Unrecognized desktop selection. Raw hex bytes of what was captured: [$(printf '%s' "$choice" | od -An -tx1 | tr -s ' \n' ' ')] (length ${#choice} chars) — tell Claude this exact bracketed hex string."
                 fi
-                warn "Unrecognized selection: '${choice}'. Please try again (attempt ${attempts}/3)."
+                warn "Unrecognized selection (hex: [$(printf '%s' "$choice" | od -An -tx1 | tr -s ' \n' ' ')]). Please try again (attempt ${attempts}/3)."
                 ;;
         esac
     done
