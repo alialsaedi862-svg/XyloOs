@@ -36,6 +36,20 @@ trap 'echo; err "Interrupted."; exit 130' INT TERM
 HAVE_DIALOG=0
 command -v dialog &>/dev/null && HAVE_DIALOG=1
 
+# Strip carriage returns and leading/trailing whitespace from anything
+# captured from dialog. On some terminals/hardware dialog's output can
+# pick up trailing control characters that are invisible when printed
+# but break exact string/case matching later — this was the root cause
+# of desktop selection silently failing to match even a visually-correct
+# choice like "gnome". Every dialog capture below is piped through this.
+clean_choice() {
+    local s="$1"
+    s="${s//$'\r'/}"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
 # Small helper: yes/no confirm, dialog when available, plain read as a
 # last-resort fallback (only reachable if dialog is somehow missing).
 confirm() {
@@ -61,7 +75,7 @@ menu_pick() {
         out=$(dialog --clear --backtitle "xyloOS Installer" --title "$title" \
             --menu "$prompt" "$h" "$w" "$mh" "$@" 3>&1 1>&2 2>&3)
         clear
-        printf '%s' "$out"
+        printf '%s' "$(clean_choice "$out")"
         return 0
     fi
     return 1
@@ -209,6 +223,7 @@ step_wifi() {
                 --title "Select Wi-Fi Network" \
                 --menu "Use Up/Down arrows and Enter to select:" 20 60 12 \
                 "${menu_items[@]}" 3>&1 1>&2 2>&3)
+            ssid=$(clean_choice "$ssid")
             clear
             [[ "$ssid" == "(Enter SSID manually)" ]] && ssid=""
         fi
@@ -230,6 +245,7 @@ step_wifi() {
                 --title "Wi-Fi Password" \
                 --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60 \
                 3>&1 1>&2 2>&3)
+            pass="${pass//$'\r'/}"
             clear
         else
             read -rsp "Password for '$ssid' (blank = open network): " pass; echo
@@ -294,6 +310,7 @@ step_timezone() {
             --title "Select Region" \
             --menu "Use Up/Down arrows and Enter to select:" 22 50 15 \
             "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        region=$(clean_choice "$region")
         clear
     fi
     [[ -n "$region" ]] || die "No region selected."
@@ -309,6 +326,7 @@ step_timezone() {
             --title "Select City / Timezone ($region)" \
             --menu "Use Up/Down arrows and Enter to select:" 22 60 15 \
             "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        city=$(clean_choice "$city")
         clear
     fi
     [[ -n "$city" ]] || die "No timezone selected."
@@ -328,6 +346,7 @@ step_user() {
             XYLO_USER=$(dialog --clear --backtitle "xyloOS Installer" --title "User Account" \
                 --inputbox "Choose a username (lowercase, no spaces):" 10 60 \
                 3>&1 1>&2 2>&3)
+            XYLO_USER=$(clean_choice "$XYLO_USER")
             clear
         else
             read -rp "Choose a username: " XYLO_USER
@@ -341,10 +360,12 @@ step_user() {
             pw1=$(dialog --clear --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60 \
                 3>&1 1>&2 2>&3)
+            pw1="${pw1//$'\r'/}"
             clear
             pw2=$(dialog --clear --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Confirm password:" 10 60 \
                 3>&1 1>&2 2>&3)
+            pw2="${pw2//$'\r'/}"
             clear
         else
             read -rsp "Enter password: " pw1; echo
@@ -515,6 +536,7 @@ step_disk() {
                 --title "Select Target Drive" \
                 --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
                 18 60 8 "${menu_items[@]}" 3>&1 1>&2 2>&3)
+            TARGET_DISK=$(clean_choice "$TARGET_DISK")
             clear
         fi
         [[ -n "$TARGET_DISK" ]] && break
