@@ -55,7 +55,7 @@ clean_choice() {
 confirm() {
     local prompt="$1"
     if [[ $HAVE_DIALOG -eq 1 ]]; then
-        dialog --clear --backtitle "xyloOS Installer" --title "Confirm" \
+        dialog --backtitle "xyloOS Installer" --title "Confirm" \
             --yesno "$prompt" 12 66
         local rc=$?
         clear
@@ -72,7 +72,7 @@ menu_pick() {
     local title="$1" prompt="$2" h="$3" w="$4" mh="$5"; shift 5
     if [[ $HAVE_DIALOG -eq 1 ]]; then
         local out
-        out=$(dialog --clear --backtitle "xyloOS Installer" --title "$title" \
+        out=$(dialog --backtitle "xyloOS Installer" --title "$title" \
             --menu "$prompt" "$h" "$w" "$mh" "$@" 3>&1 1>&2 2>&3)
         clear
         printf '%s' "$(clean_choice "$out")"
@@ -219,7 +219,7 @@ step_wifi() {
                 menu_items+=("$s" "")
             done
             menu_items+=("(Enter SSID manually)" "")
-            ssid=$(dialog --clear --backtitle "xyloOS Installer" \
+            ssid=$(dialog --backtitle "xyloOS Installer" \
                 --title "Select Wi-Fi Network" \
                 --menu "Use Up/Down arrows and Enter to select:" 20 60 12 \
                 "${menu_items[@]}" 3>&1 1>&2 2>&3)
@@ -241,7 +241,7 @@ step_wifi() {
 
         local pass
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            pass=$(dialog --clear --backtitle "xyloOS Installer" \
+            pass=$(dialog --backtitle "xyloOS Installer" \
                 --title "Wi-Fi Password" \
                 --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60 \
                 3>&1 1>&2 2>&3)
@@ -306,7 +306,7 @@ step_timezone() {
         for r in "${regions[@]}"; do
             menu_items+=("$r" "")
         done
-        region=$(dialog --clear --backtitle "xyloOS Installer" \
+        region=$(dialog --backtitle "xyloOS Installer" \
             --title "Select Region" \
             --menu "Use Up/Down arrows and Enter to select:" 22 50 15 \
             "${menu_items[@]}" 3>&1 1>&2 2>&3)
@@ -322,7 +322,7 @@ step_timezone() {
         for c in "${cities[@]}"; do
             menu_items+=("$c" "")
         done
-        city=$(dialog --clear --backtitle "xyloOS Installer" \
+        city=$(dialog --backtitle "xyloOS Installer" \
             --title "Select City / Timezone ($region)" \
             --menu "Use Up/Down arrows and Enter to select:" 22 60 15 \
             "${menu_items[@]}" 3>&1 1>&2 2>&3)
@@ -343,7 +343,7 @@ step_user() {
     banner "STEP 4: User Account"
     while true; do
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            XYLO_USER=$(dialog --clear --backtitle "xyloOS Installer" --title "User Account" \
+            XYLO_USER=$(dialog --backtitle "xyloOS Installer" --title "User Account" \
                 --inputbox "Choose a username (lowercase, no spaces):" 10 60 \
                 3>&1 1>&2 2>&3)
             XYLO_USER=$(clean_choice "$XYLO_USER")
@@ -357,12 +357,12 @@ step_user() {
     while true; do
         local pw1 pw2
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            pw1=$(dialog --clear --backtitle "xyloOS Installer" --title "Password" \
+            pw1=$(dialog --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60 \
                 3>&1 1>&2 2>&3)
             pw1="${pw1//$'\r'/}"
             clear
-            pw2=$(dialog --clear --backtitle "xyloOS Installer" --title "Password" \
+            pw2=$(dialog --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Confirm password:" 10 60 \
                 3>&1 1>&2 2>&3)
             pw2="${pw2//$'\r'/}"
@@ -532,7 +532,7 @@ step_disk() {
     while true; do
         TARGET_DISK=""
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            TARGET_DISK=$(dialog --clear --backtitle "xyloOS Installer" \
+            TARGET_DISK=$(dialog --backtitle "xyloOS Installer" \
                 --title "Select Target Drive" \
                 --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
                 18 60 8 "${menu_items[@]}" 3>&1 1>&2 2>&3)
