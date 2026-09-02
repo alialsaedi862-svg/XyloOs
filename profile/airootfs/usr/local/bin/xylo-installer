@@ -44,6 +44,15 @@ command -v dialog &>/dev/null && HAVE_DIALOG=1
 # choice like "gnome". Every dialog capture below is piped through this.
 clean_choice() {
     local s="$1"
+    # Strip ANY ANSI/VT100 terminal escape sequence (ESC [ ... terminator)
+    # wherever it appears in the string, not just at the edges. Confirmed
+    # via a hex dump of a real failure that dialog's captured output can
+    # come back with terminal control codes stuck to the front of an
+    # otherwise completely correct selection (e.g. literal bytes
+    # ESC[@ ESC[J ESC[3J immediately before "gnome") — removing dialog's
+    # own --clear flag did not stop this, so this strips the sequences
+    # themselves regardless of where they come from.
+    s=$(printf '%s' "$s" | sed -E 's/\x1b\[[0-9;]*[@-~]//g')
     s="${s//$'\r'/}"
     s="${s#"${s%%[![:space:]]*}"}"
     s="${s%"${s##*[![:space:]]}"}"
@@ -55,7 +64,7 @@ clean_choice() {
 confirm() {
     local prompt="$1"
     if [[ $HAVE_DIALOG -eq 1 ]]; then
-        dialog --backtitle "xyloOS Installer" --title "Confirm" \
+        dialog --stdout --backtitle "xyloOS Installer" --title "Confirm" \
             --yesno "$prompt" 12 66
         local rc=$?
         clear
@@ -72,8 +81,8 @@ menu_pick() {
     local title="$1" prompt="$2" h="$3" w="$4" mh="$5"; shift 5
     if [[ $HAVE_DIALOG -eq 1 ]]; then
         local out
-        out=$(dialog --backtitle "xyloOS Installer" --title "$title" \
-            --menu "$prompt" "$h" "$w" "$mh" "$@" 3>&1 1>&2 2>&3)
+        out=$(dialog --stdout --backtitle "xyloOS Installer" --title "$title" \
+            --menu "$prompt" "$h" "$w" "$mh" "$@")
         clear
         printf '%s' "$(clean_choice "$out")"
         return 0
@@ -219,10 +228,10 @@ step_wifi() {
                 menu_items+=("$s" "")
             done
             menu_items+=("(Enter SSID manually)" "")
-            ssid=$(dialog --backtitle "xyloOS Installer" \
+            ssid=$(dialog --stdout --backtitle "xyloOS Installer" \
                 --title "Select Wi-Fi Network" \
                 --menu "Use Up/Down arrows and Enter to select:" 20 60 12 \
-                "${menu_items[@]}" 3>&1 1>&2 2>&3)
+                "${menu_items[@]}")
             ssid=$(clean_choice "$ssid")
             clear
             [[ "$ssid" == "(Enter SSID manually)" ]] && ssid=""
@@ -241,10 +250,11 @@ step_wifi() {
 
         local pass
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            pass=$(dialog --backtitle "xyloOS Installer" \
+            pass=$(dialog --stdout --backtitle "xyloOS Installer" \
                 --title "Wi-Fi Password" \
                 --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60 \
-                3>&1 1>&2 2>&3)
+               )
+            pass=$(printf '%s' "$pass" | sed -E 's/\x1b\[[0-9;]*[@-~]//g')
             pass="${pass//$'\r'/}"
             clear
         else
@@ -306,10 +316,10 @@ step_timezone() {
         for r in "${regions[@]}"; do
             menu_items+=("$r" "")
         done
-        region=$(dialog --backtitle "xyloOS Installer" \
+        region=$(dialog --stdout --backtitle "xyloOS Installer" \
             --title "Select Region" \
             --menu "Use Up/Down arrows and Enter to select:" 22 50 15 \
-            "${menu_items[@]}" 3>&1 1>&2 2>&3)
+            "${menu_items[@]}")
         region=$(clean_choice "$region")
         clear
     fi
@@ -322,10 +332,10 @@ step_timezone() {
         for c in "${cities[@]}"; do
             menu_items+=("$c" "")
         done
-        city=$(dialog --backtitle "xyloOS Installer" \
+        city=$(dialog --stdout --backtitle "xyloOS Installer" \
             --title "Select City / Timezone ($region)" \
             --menu "Use Up/Down arrows and Enter to select:" 22 60 15 \
-            "${menu_items[@]}" 3>&1 1>&2 2>&3)
+            "${menu_items[@]}")
         city=$(clean_choice "$city")
         clear
     fi
@@ -343,9 +353,9 @@ step_user() {
     banner "STEP 4: User Account"
     while true; do
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            XYLO_USER=$(dialog --backtitle "xyloOS Installer" --title "User Account" \
+            XYLO_USER=$(dialog --stdout --backtitle "xyloOS Installer" --title "User Account" \
                 --inputbox "Choose a username (lowercase, no spaces):" 10 60 \
-                3>&1 1>&2 2>&3)
+               )
             XYLO_USER=$(clean_choice "$XYLO_USER")
             clear
         else
@@ -357,14 +367,16 @@ step_user() {
     while true; do
         local pw1 pw2
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            pw1=$(dialog --backtitle "xyloOS Installer" --title "Password" \
+            pw1=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60 \
-                3>&1 1>&2 2>&3)
+               )
+            pw1=$(printf '%s' "$pw1" | sed -E 's/\x1b\[[0-9;]*[@-~]//g')
             pw1="${pw1//$'\r'/}"
             clear
-            pw2=$(dialog --backtitle "xyloOS Installer" --title "Password" \
+            pw2=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Confirm password:" 10 60 \
-                3>&1 1>&2 2>&3)
+               )
+            pw2=$(printf '%s' "$pw2" | sed -E 's/\x1b\[[0-9;]*[@-~]//g')
             pw2="${pw2//$'\r'/}"
             clear
         else
@@ -532,10 +544,10 @@ step_disk() {
     while true; do
         TARGET_DISK=""
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            TARGET_DISK=$(dialog --backtitle "xyloOS Installer" \
+            TARGET_DISK=$(dialog --stdout --backtitle "xyloOS Installer" \
                 --title "Select Target Drive" \
                 --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
-                18 60 8 "${menu_items[@]}" 3>&1 1>&2 2>&3)
+                18 60 8 "${menu_items[@]}")
             TARGET_DISK=$(clean_choice "$TARGET_DISK")
             clear
         fi
