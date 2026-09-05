@@ -18,6 +18,14 @@
 #
 set -uo pipefail
 
+# Force a consistent, predictable locale for the whole script. Byte-range
+# regex/pattern matching (used below to strip terminal escape sequences)
+# and sed/grep behavior can vary subtly under different locales — this
+# removes that variable entirely rather than hoping every string
+# operation in this script happens to behave the same way it did in
+# testing.
+export LC_ALL=C
+
 BOLD=$'\033[1m'; RESET=$'\033[0m'
 CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; YELLOW=$'\033[1;33m'
 banner() { echo; printf '%s=== %s ===%s\n' "$BOLD$CYAN" "$*" "$RESET"; }
@@ -42,17 +50,29 @@ command -v dialog &>/dev/null && HAVE_DIALOG=1
 # but break exact string/case matching later — this was the root cause
 # of desktop selection silently failing to match even a visually-correct
 # choice like "gnome". Every dialog capture below is piped through this.
+# Strip ANY ANSI/VT100 terminal escape sequence (ESC [ ... terminator)
+# wherever it appears in a string, using only bash's own builtin regex
+# engine — no external sed/grep call. Confirmed via a hex dump of a real
+# failure that dialog's captured output can come back with terminal
+# control codes stuck to the front of an otherwise completely correct
+# selection (e.g. literal bytes ESC[@ ESC[J ESC[3J immediately before
+# "gnome"). Two earlier fix attempts (removing dialog's --clear flag,
+# then an external `sed -E` strip) both failed to actually stop this on
+# the real hardware despite working in testing — moving to a pure-bash
+# implementation removes any dependency on external tool behavior or
+# locale-sensitive regex handling that could explain that gap.
+strip_escapes() {
+    local s="$1" esc
+    esc=$(printf '\x1b')
+    while [[ "$s" =~ ^([^$esc]*)$esc\[[0-9\;]*[@-~](.*)$ ]]; do
+        s="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+    done
+    printf '%s' "$s"
+}
+
 clean_choice() {
     local s="$1"
-    # Strip ANY ANSI/VT100 terminal escape sequence (ESC [ ... terminator)
-    # wherever it appears in the string, not just at the edges. Confirmed
-    # via a hex dump of a real failure that dialog's captured output can
-    # come back with terminal control codes stuck to the front of an
-    # otherwise completely correct selection (e.g. literal bytes
-    # ESC[@ ESC[J ESC[3J immediately before "gnome") — removing dialog's
-    # own --clear flag did not stop this, so this strips the sequences
-    # themselves regardless of where they come from.
-    s=$(printf '%s' "$s" | sed -E 's/\x1b\[[0-9;]*[@-~]//g')
+    s="$(strip_escapes "$s")"
     s="${s//$'\r'/}"
     s="${s#"${s%%[![:space:]]*}"}"
     s="${s%"${s##*[![:space:]]}"}"
@@ -254,7 +274,7 @@ step_wifi() {
                 --title "Wi-Fi Password" \
                 --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60 \
                )
-            pass=$(printf '%s' "$pass" | sed -E 's/\x1b\[[0-9;]*[@-~]//g')
+            pass="$(strip_escapes "$pass")"
             pass="${pass//$'\r'/}"
             clear
         else
@@ -370,13 +390,13 @@ step_user() {
             pw1=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60 \
                )
-            pw1=$(printf '%s' "$pw1" | sed -E 's/\x1b\[[0-9;]*[@-~]//g')
+            pw1="$(strip_escapes "$pw1")"
             pw1="${pw1//$'\r'/}"
             clear
             pw2=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Confirm password:" 10 60 \
                )
-            pw2=$(printf '%s' "$pw2" | sed -E 's/\x1b\[[0-9;]*[@-~]//g')
+            pw2="$(strip_escapes "$pw2")"
             pw2="${pw2//$'\r'/}"
             clear
         else
