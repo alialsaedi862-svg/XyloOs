@@ -100,10 +100,13 @@ menu_pick() {
     # $1=title  $2=prompt  $3=height  $4=width  $5=menu-height  then tag/desc pairs...
     local title="$1" prompt="$2" h="$3" w="$4" mh="$5"; shift 5
     if [[ $HAVE_DIALOG -eq 1 ]]; then
-        local out
-        out=$(dialog --stdout --backtitle "xyloOS Installer" --title "$title" \
-            --menu "$prompt" "$h" "$w" "$mh" "$@")
+        local out tmpfile
+        tmpfile=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+        dialog --output-fd 3 --backtitle "xyloOS Installer" --title "$title" \
+            --menu "$prompt" "$h" "$w" "$mh" "$@" 3>"$tmpfile"
         clear
+        out=$(cat "$tmpfile" 2>/dev/null)
+        rm -f "$tmpfile"
         printf '%s' "$(clean_choice "$out")"
         return 0
     fi
@@ -248,10 +251,12 @@ step_wifi() {
                 menu_items+=("$s" "")
             done
             menu_items+=("(Enter SSID manually)" "")
-            ssid=$(dialog --stdout --backtitle "xyloOS Installer" \
+            local ssid_tmp; ssid_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+            dialog --output-fd 3 --backtitle "xyloOS Installer" \
                 --title "Select Wi-Fi Network" \
                 --menu "Use Up/Down arrows and Enter to select:" 20 60 12 \
-                "${menu_items[@]}")
+                "${menu_items[@]}" 3>"$ssid_tmp"
+            ssid=$(cat "$ssid_tmp" 2>/dev/null); rm -f "$ssid_tmp"
             ssid=$(clean_choice "$ssid")
             clear
             [[ "$ssid" == "(Enter SSID manually)" ]] && ssid=""
@@ -270,10 +275,12 @@ step_wifi() {
 
         local pass
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            pass=$(dialog --stdout --backtitle "xyloOS Installer" \
+            local pass_tmp; pass_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+            dialog --output-fd 3 --backtitle "xyloOS Installer" \
                 --title "Wi-Fi Password" \
                 --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60 \
-               )
+                3>"$pass_tmp"
+            pass=$(cat "$pass_tmp" 2>/dev/null); rm -f "$pass_tmp"
             pass="$(strip_escapes "$pass")"
             pass="${pass//$'\r'/}"
             clear
@@ -336,10 +343,12 @@ step_timezone() {
         for r in "${regions[@]}"; do
             menu_items+=("$r" "")
         done
-        region=$(dialog --stdout --backtitle "xyloOS Installer" \
+        local region_tmp; region_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+        dialog --output-fd 3 --backtitle "xyloOS Installer" \
             --title "Select Region" \
             --menu "Use Up/Down arrows and Enter to select:" 22 50 15 \
-            "${menu_items[@]}")
+            "${menu_items[@]}" 3>"$region_tmp"
+        region=$(cat "$region_tmp" 2>/dev/null); rm -f "$region_tmp"
         region=$(clean_choice "$region")
         clear
     fi
@@ -352,10 +361,12 @@ step_timezone() {
         for c in "${cities[@]}"; do
             menu_items+=("$c" "")
         done
-        city=$(dialog --stdout --backtitle "xyloOS Installer" \
+        local city_tmp; city_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+        dialog --output-fd 3 --backtitle "xyloOS Installer" \
             --title "Select City / Timezone ($region)" \
             --menu "Use Up/Down arrows and Enter to select:" 22 60 15 \
-            "${menu_items[@]}")
+            "${menu_items[@]}" 3>"$city_tmp"
+        city=$(cat "$city_tmp" 2>/dev/null); rm -f "$city_tmp"
         city=$(clean_choice "$city")
         clear
     fi
@@ -373,9 +384,11 @@ step_user() {
     banner "STEP 4: User Account"
     while true; do
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            XYLO_USER=$(dialog --stdout --backtitle "xyloOS Installer" --title "User Account" \
+            local user_tmp; user_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+            dialog --output-fd 3 --backtitle "xyloOS Installer" --title "User Account" \
                 --inputbox "Choose a username (lowercase, no spaces):" 10 60 \
-               )
+                3>"$user_tmp"
+            XYLO_USER=$(cat "$user_tmp" 2>/dev/null); rm -f "$user_tmp"
             XYLO_USER=$(clean_choice "$XYLO_USER")
             clear
         else
@@ -387,15 +400,19 @@ step_user() {
     while true; do
         local pw1 pw2
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            pw1=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
+            local pw1_tmp; pw1_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+            dialog --output-fd 3 --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60 \
-               )
+                3>"$pw1_tmp"
+            pw1=$(cat "$pw1_tmp" 2>/dev/null); rm -f "$pw1_tmp"
             pw1="$(strip_escapes "$pw1")"
             pw1="${pw1//$'\r'/}"
             clear
-            pw2=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
+            local pw2_tmp; pw2_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+            dialog --output-fd 3 --backtitle "xyloOS Installer" --title "Password" \
                 --insecure --passwordbox "Confirm password:" 10 60 \
-               )
+                3>"$pw2_tmp"
+            pw2=$(cat "$pw2_tmp" 2>/dev/null); rm -f "$pw2_tmp"
             pw2="$(strip_escapes "$pw2")"
             pw2="${pw2//$'\r'/}"
             clear
@@ -564,10 +581,12 @@ step_disk() {
     while true; do
         TARGET_DISK=""
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            TARGET_DISK=$(dialog --stdout --backtitle "xyloOS Installer" \
+            local disk_tmp; disk_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
+            dialog --output-fd 3 --backtitle "xyloOS Installer" \
                 --title "Select Target Drive" \
                 --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
-                18 60 8 "${menu_items[@]}")
+                18 60 8 "${menu_items[@]}" 3>"$disk_tmp"
+            TARGET_DISK=$(cat "$disk_tmp" 2>/dev/null); rm -f "$disk_tmp"
             TARGET_DISK=$(clean_choice "$TARGET_DISK")
             clear
         fi
