@@ -26,6 +26,28 @@ set -uo pipefail
 # testing.
 export LC_ALL=C
 
+# Force a known-good, universally-available terminal type. This live
+# medium's getty is started with --noclear and no explicit $TERM, so
+# whatever agetty happens to default to is what dialog/ncurses use to
+# decide how to draw and interpret input. Pinning this explicitly
+# removes any ambiguity about terminal capability detection as a
+# possible contributor to dialog misbehaving.
+export TERM=linux
+
+# Drain any bytes currently sitting in the terminal's input buffer
+# before a dialog screen opens. Terminals can send status/cursor-report
+# responses back over the same channel keystrokes arrive on; if one of
+# those responses from a PREVIOUS screen arrives late (after that
+# dialog process has already exited), it sits in the buffer and gets
+# handed to the NEXT dialog invocation as if it were input — which can
+# surface as exactly the kind of terminal-control-code contamination
+# seen in this wizard's captured answers. This clears that out first,
+# every time, so nothing stale carries over between screens.
+drain_stale_input() {
+    local junk
+    { while read -r -t 0.05 -n 4096 junk < /dev/tty; do :; done; } 2>/dev/null
+}
+
 BOLD=$'\033[1m'; RESET=$'\033[0m'
 CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; YELLOW=$'\033[1;33m'
 banner() { echo; printf '%s=== %s ===%s\n' "$BOLD$CYAN" "$*" "$RESET"; }
@@ -34,7 +56,13 @@ ok()    { printf '%s[OK]%s %s\n' "$GREEN"  "$RESET" "$*"; }
 warn()  { printf '%s[!]%s %s\n'  "$YELLOW" "$RESET" "$*"; }
 err()   { printf '%s[ERROR]%s %s\n' "$RED" "$RESET" "$*"; }
 die()   { err "$*"; exit 1; }
-strip_ansi() { sed -r 's/\x1b\[[0-9;]*[a-zA-Z]//g'; }
+strip_ansi() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        strip_escapes "$line"
+        printf '\n'
+    done
+}
 
 require_root() { [[ $EUID -eq 0 ]] || die "Run as root."; }
 
@@ -62,16 +90,56 @@ command -v dialog &>/dev/null && HAVE_DIALOG=1
 # implementation removes any dependency on external tool behavior or
 # locale-sensitive regex handling that could explain that gap.
 strip_escapes() {
-    local s="$1" esc
+    local s="$1" esc out=""
     esc=$(printf '\x1b')
-    while [[ "$s" =~ ^([^$esc]*)$esc\[[0-9\;]*[@-~](.*)$ ]]; do
-        s="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+    # Single left-to-right pass using only parameter expansion (no regex
+    # re-matching against a shrinking string each iteration) — the
+    # previous implementation was effectively O(n^2) and took several
+    # seconds on a synthetic worst-case input far larger than anything
+    # observed so far, but there's no reason to leave that cliff in
+    # place when a linear-time version is just as simple to write.
+    while [[ "$s" == *"$esc"* ]]; do
+        out+="${s%%"$esc"*}"
+        s="${s#*"$esc"}"
+        if [[ "$s" == "["* ]]; then
+            s="${s#\[}"
+            while [[ "$s" == [0-9\;]* ]]; do
+                s="${s:1}"
+            done
+            [[ -n "$s" ]] && s="${s:1}"
+        fi
     done
+    out+="$s"
+    printf '%s' "$out"
+}
+
+# Bound an input's length before strip_escapes touches it, regardless of
+# how much contamination a capture theoretically contains — no
+# legitimate answer anywhere in this wizard (username, password, SSID,
+# disk path, DE tag, region/city name) is ever more than a couple
+# hundred characters, and observed contamination consistently puts the
+# real answer at the END of the noise. A naive fixed-length truncation
+# can cut an escape sequence in half, leaving an unparseable fragment
+# stuck to the front of the result — so this truncates to the LAST
+# escape sequence found within the tail window instead, guaranteeing
+# every kept byte starts from a clean boundary.
+bound_length() {
+    local s="$1"
+    if [[ ${#s} -gt 300 ]]; then
+        local tail="${s: -300}" esc
+        esc=$(printf '\x1b')
+        if [[ "$tail" == *"$esc"* ]]; then
+            s="${esc}${tail##*"$esc"}"
+        else
+            s="$tail"
+        fi
+    fi
     printf '%s' "$s"
 }
 
 clean_choice() {
     local s="$1"
+    s="$(bound_length "$s")"
     s="$(strip_escapes "$s")"
     s="${s//$'\r'/}"
     s="${s#"${s%%[![:space:]]*}"}"
@@ -84,6 +152,7 @@ clean_choice() {
 confirm() {
     local prompt="$1"
     if [[ $HAVE_DIALOG -eq 1 ]]; then
+        drain_stale_input
         dialog --stdout --backtitle "xyloOS Installer" --title "Confirm" \
             --yesno "$prompt" 12 66
         local rc=$?
@@ -100,13 +169,11 @@ menu_pick() {
     # $1=title  $2=prompt  $3=height  $4=width  $5=menu-height  then tag/desc pairs...
     local title="$1" prompt="$2" h="$3" w="$4" mh="$5"; shift 5
     if [[ $HAVE_DIALOG -eq 1 ]]; then
-        local out tmpfile
-        tmpfile=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-        dialog --output-fd 3 --backtitle "xyloOS Installer" --title "$title" \
-            --menu "$prompt" "$h" "$w" "$mh" "$@" 3>"$tmpfile"
+        local out
+        drain_stale_input
+        out=$(dialog --stdout --backtitle "xyloOS Installer" --title "$title" \
+            --menu "$prompt" "$h" "$w" "$mh" "$@")
         clear
-        out=$(cat "$tmpfile" 2>/dev/null)
-        rm -f "$tmpfile"
         printf '%s' "$(clean_choice "$out")"
         return 0
     fi
@@ -251,12 +318,11 @@ step_wifi() {
                 menu_items+=("$s" "")
             done
             menu_items+=("(Enter SSID manually)" "")
-            local ssid_tmp; ssid_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-            dialog --output-fd 3 --backtitle "xyloOS Installer" \
+            drain_stale_input
+            ssid=$(dialog --stdout --backtitle "xyloOS Installer" \
                 --title "Select Wi-Fi Network" \
                 --menu "Use Up/Down arrows and Enter to select:" 20 60 12 \
-                "${menu_items[@]}" 3>"$ssid_tmp"
-            ssid=$(cat "$ssid_tmp" 2>/dev/null); rm -f "$ssid_tmp"
+                "${menu_items[@]}")
             ssid=$(clean_choice "$ssid")
             clear
             [[ "$ssid" == "(Enter SSID manually)" ]] && ssid=""
@@ -275,12 +341,11 @@ step_wifi() {
 
         local pass
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            local pass_tmp; pass_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-            dialog --output-fd 3 --backtitle "xyloOS Installer" \
+            drain_stale_input
+            pass=$(dialog --stdout --backtitle "xyloOS Installer" \
                 --title "Wi-Fi Password" \
-                --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60 \
-                3>"$pass_tmp"
-            pass=$(cat "$pass_tmp" 2>/dev/null); rm -f "$pass_tmp"
+                --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60)
+            pass="$(bound_length "$pass")"
             pass="$(strip_escapes "$pass")"
             pass="${pass//$'\r'/}"
             clear
@@ -337,40 +402,76 @@ step_timezone() {
     mapfile -t regions < <(find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 -type d \
         -printf '%f\n' | grep -Ev '^(posix|right|Etc|SystemV)$' | sort)
 
-    local region=""
-    if [[ $HAVE_DIALOG -eq 1 ]]; then
-        local menu_items=()
-        for r in "${regions[@]}"; do
-            menu_items+=("$r" "")
-        done
-        local region_tmp; region_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-        dialog --output-fd 3 --backtitle "xyloOS Installer" \
-            --title "Select Region" \
-            --menu "Use Up/Down arrows and Enter to select:" 22 50 15 \
-            "${menu_items[@]}" 3>"$region_tmp"
-        region=$(cat "$region_tmp" 2>/dev/null); rm -f "$region_tmp"
-        region=$(clean_choice "$region")
-        clear
-    fi
-    [[ -n "$region" ]] || die "No region selected."
+    local region="" attempts=0
+    while true; do
+        if [[ $HAVE_DIALOG -eq 1 ]]; then
+            local menu_items=()
+            for r in "${regions[@]}"; do
+                menu_items+=("$r" "")
+            done
+            drain_stale_input
+            region=$(dialog --stdout --backtitle "xyloOS Installer" \
+                --title "Select Region" \
+                --menu "Use Up/Down arrows and Enter to select:" 22 50 15 \
+                "${menu_items[@]}")
+            region=$(clean_choice "$region")
+            clear
+            # Safety net matching step_disk()'s pattern: only accept an
+            # EXACT match against a known-real region, or one found as a
+            # substring within whatever was captured (tolerates leftover
+            # contamination) — never fall through on an unvalidated value.
+            if [[ -n "$region" ]]; then
+                local valid_hit=""
+                for r in "${regions[@]}"; do
+                    if [[ "$region" == "$r" || "$region" == *"$r"* ]]; then
+                        valid_hit="$r"
+                        break
+                    fi
+                done
+                region="$valid_hit"
+            fi
+        fi
+        [[ -n "$region" ]] && break
+        ((attempts++))
+        if [[ $attempts -ge 3 ]]; then
+            die "No valid region was selected after ${attempts} attempts. Tell Claude if this recurs."
+        fi
+        warn "No valid region selected. Please try again (attempt ${attempts}/3)."
+    done
 
     mapfile -t cities < <(find "/usr/share/zoneinfo/$region" -type f -printf '%f\n' | sort)
-    local city=""
-    if [[ $HAVE_DIALOG -eq 1 ]]; then
-        local menu_items=()
-        for c in "${cities[@]}"; do
-            menu_items+=("$c" "")
-        done
-        local city_tmp; city_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-        dialog --output-fd 3 --backtitle "xyloOS Installer" \
-            --title "Select City / Timezone ($region)" \
-            --menu "Use Up/Down arrows and Enter to select:" 22 60 15 \
-            "${menu_items[@]}" 3>"$city_tmp"
-        city=$(cat "$city_tmp" 2>/dev/null); rm -f "$city_tmp"
-        city=$(clean_choice "$city")
-        clear
-    fi
-    [[ -n "$city" ]] || die "No timezone selected."
+    local city="" city_attempts=0
+    while true; do
+        if [[ $HAVE_DIALOG -eq 1 ]]; then
+            local menu_items=()
+            for c in "${cities[@]}"; do
+                menu_items+=("$c" "")
+            done
+            drain_stale_input
+            city=$(dialog --stdout --backtitle "xyloOS Installer" \
+                --title "Select City / Timezone ($region)" \
+                --menu "Use Up/Down arrows and Enter to select:" 22 60 15 \
+                "${menu_items[@]}")
+            city=$(clean_choice "$city")
+            clear
+            if [[ -n "$city" ]]; then
+                local valid_hit=""
+                for c in "${cities[@]}"; do
+                    if [[ "$city" == "$c" || "$city" == *"$c"* ]]; then
+                        valid_hit="$c"
+                        break
+                    fi
+                done
+                city="$valid_hit"
+            fi
+        fi
+        [[ -n "$city" ]] && break
+        ((city_attempts++))
+        if [[ $city_attempts -ge 3 ]]; then
+            die "No valid city was selected after ${city_attempts} attempts. Tell Claude if this recurs."
+        fi
+        warn "No valid city selected. Please try again (attempt ${city_attempts}/3)."
+    done
 
     TIMEZONE="$region/$city"
     timedatectl set-ntp true 2>/dev/null || true
@@ -384,11 +485,9 @@ step_user() {
     banner "STEP 4: User Account"
     while true; do
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            local user_tmp; user_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-            dialog --output-fd 3 --backtitle "xyloOS Installer" --title "User Account" \
-                --inputbox "Choose a username (lowercase, no spaces):" 10 60 \
-                3>"$user_tmp"
-            XYLO_USER=$(cat "$user_tmp" 2>/dev/null); rm -f "$user_tmp"
+            drain_stale_input
+            XYLO_USER=$(dialog --stdout --backtitle "xyloOS Installer" --title "User Account" \
+                --inputbox "Choose a username (lowercase, no spaces):" 10 60)
             XYLO_USER=$(clean_choice "$XYLO_USER")
             clear
         else
@@ -400,19 +499,17 @@ step_user() {
     while true; do
         local pw1 pw2
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            local pw1_tmp; pw1_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-            dialog --output-fd 3 --backtitle "xyloOS Installer" --title "Password" \
-                --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60 \
-                3>"$pw1_tmp"
-            pw1=$(cat "$pw1_tmp" 2>/dev/null); rm -f "$pw1_tmp"
+            drain_stale_input
+            pw1=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
+                --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60)
+            pw1="$(bound_length "$pw1")"
             pw1="$(strip_escapes "$pw1")"
             pw1="${pw1//$'\r'/}"
             clear
-            local pw2_tmp; pw2_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-            dialog --output-fd 3 --backtitle "xyloOS Installer" --title "Password" \
-                --insecure --passwordbox "Confirm password:" 10 60 \
-                3>"$pw2_tmp"
-            pw2=$(cat "$pw2_tmp" 2>/dev/null); rm -f "$pw2_tmp"
+            drain_stale_input
+            pw2=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
+                --insecure --passwordbox "Confirm password:" 10 60)
+            pw2="$(bound_length "$pw2")"
             pw2="$(strip_escapes "$pw2")"
             pw2="${pw2//$'\r'/}"
             clear
@@ -474,6 +571,23 @@ MENU
             gnome|kde|xfce|mate|cinnamon|lxqt|lxde|budgie|hyprland|sway|i3|bspwm|awesome|xmonad|herbstluftwm|dwm|none|"")
                 break
                 ;;
+            *herbstluftwm*) choice="herbstluftwm"; break ;;
+            *hyprland*)     choice="hyprland";     break ;;
+            *cinnamon*)     choice="cinnamon";     break ;;
+            *budgie*)       choice="budgie";       break ;;
+            *awesome*)      choice="awesome";      break ;;
+            *xmonad*)       choice="xmonad";       break ;;
+            *bspwm*)        choice="bspwm";        break ;;
+            *gnome*)        choice="gnome";        break ;;
+            *lxqt*)         choice="lxqt";         break ;;
+            *lxde*)         choice="lxde";         break ;;
+            *xfce*)         choice="xfce";         break ;;
+            *mate*)         choice="mate";         break ;;
+            *sway*)         choice="sway";         break ;;
+            *kde*)          choice="kde";          break ;;
+            *dwm*)          choice="dwm";          break ;;
+            *i3*)           choice="i3";           break ;;
+            *none*)         choice="none";         break ;;
             *)
                 ((attempts++))
                 if [[ $attempts -ge 3 ]]; then
@@ -581,14 +695,31 @@ step_disk() {
     while true; do
         TARGET_DISK=""
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            local disk_tmp; disk_tmp=$(mktemp /tmp/xyloos-dialog.XXXXXX)
-            dialog --output-fd 3 --backtitle "xyloOS Installer" \
+            drain_stale_input
+            TARGET_DISK=$(dialog --stdout --backtitle "xyloOS Installer" \
                 --title "Select Target Drive" \
                 --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
-                18 60 8 "${menu_items[@]}" 3>"$disk_tmp"
-            TARGET_DISK=$(cat "$disk_tmp" 2>/dev/null); rm -f "$disk_tmp"
+                18 60 8 "${menu_items[@]}")
             TARGET_DISK=$(clean_choice "$TARGET_DISK")
             clear
+            # Safety net: only accept an EXACT match against a genuinely
+            # known disk, or one found as a substring within whatever was
+            # captured (tolerates leftover contamination) — the value is
+            # unconditionally overwritten either way, so an unrecognized
+            # or garbled capture is correctly cleared to empty and caught
+            # by the retry check below, instead of silently surviving
+            # into the destructive disk commands later in this function.
+            if [[ -n "$TARGET_DISK" ]]; then
+                local valid_hit=""
+                for d in "${disks[@]}"; do
+                    [[ -n "$boot_disk" && "$d" == "$boot_disk" ]] && continue
+                    if [[ "$TARGET_DISK" == "/dev/$d" || "$TARGET_DISK" == *"/dev/$d"* ]]; then
+                        valid_hit="/dev/$d"
+                        break
+                    fi
+                done
+                TARGET_DISK="$valid_hit"
+            fi
         fi
         [[ -n "$TARGET_DISK" ]] && break
         ((attempts++))
