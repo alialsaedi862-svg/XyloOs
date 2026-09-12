@@ -1,186 +1,111 @@
 #!/usr/bin/env bash
-#
-# xylo-installer — xyloOS interactive installation wizard (Arch Linux base)
-#
-# Flow: Language -> Wi-Fi/Network -> Region & Timezone -> User Account ->
-#       Desktop Environment -> Target Drive -> Install
-#
-# Everything below is dialog-menu / dialog-select driven. Free text is only
-# ever asked for username, password, and manual SSID/device entry as a
-# fallback when auto-detection finds nothing.
-#
-# NOTE ON PACKAGE NAMES: these were written from best available knowledge
-# of Arch's official repos, not verified against a live pacman database (no
-# Arch mirror access in the environment that authored this). Every DE/WM
-# selection below runs a `pacman -Si` availability check against your
-# actual mirrors before installing anything, and tells you plainly if a
-# package name needs correcting rather than failing silently mid-install.
-#
+# xyloOS installation wizard -- drop-in repair of the existing installer.
+# Base revision: 889bb2bdcba93946fcc9670390708fb0f8dc32d9
+# This program erases ONE explicitly selected whole disk. Back up that disk.
+# Screen output and returned dialog values must always use separate streams.
+# No disk is modified until package checks and the final confirmation pass.
 set -uo pipefail
-
-# Force a consistent, predictable locale for the whole script. Byte-range
-# regex/pattern matching (used below to strip terminal escape sequences)
-# and sed/grep behavior can vary subtly under different locales — this
-# removes that variable entirely rather than hoping every string
-# operation in this script happens to behave the same way it did in
-# testing.
+set +x
 export LC_ALL=C
+export TERM="${TERM:-linux}"
+[[ "$TERM" == dumb ]] && export TERM=linux
 
-# Force a known-good, universally-available terminal type. This live
-# medium's getty is started with --noclear and no explicit $TERM, so
-# whatever agetty happens to default to is what dialog/ncurses use to
-# decide how to draw and interpret input. Pinning this explicitly
-# removes any ambiguity about terminal capability detection as a
-# possible contributor to dialog misbehaving.
-export TERM=linux
-
-# Drain any bytes currently sitting in the terminal's input buffer
-# before a dialog screen opens. Terminals can send status/cursor-report
-# responses back over the same channel keystrokes arrive on; if one of
-# those responses from a PREVIOUS screen arrives late (after that
-# dialog process has already exited), it sits in the buffer and gets
-# handed to the NEXT dialog invocation as if it were input — which can
-# surface as exactly the kind of terminal-control-code contamination
-# seen in this wizard's captured answers. This clears that out first,
-# every time, so nothing stale carries over between screens.
-drain_stale_input() {
-    local junk
-    { while read -r -t 0.05 -n 4096 junk < /dev/tty; do :; done; } 2>/dev/null
-}
-
+INSTALLER_VERSION="2026.09.12-r1"
 BOLD=$'\033[1m'; RESET=$'\033[0m'
 CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; YELLOW=$'\033[1;33m'
-banner() { echo; printf '%s=== %s ===%s\n' "$BOLD$CYAN" "$*" "$RESET"; }
-info()  { printf '%s[*]%s %s\n'  "$CYAN"   "$RESET" "$*"; }
-ok()    { printf '%s[OK]%s %s\n' "$GREEN"  "$RESET" "$*"; }
-warn()  { printf '%s[!]%s %s\n'  "$YELLOW" "$RESET" "$*"; }
-err()   { printf '%s[ERROR]%s %s\n' "$RED" "$RESET" "$*"; }
-die()   { err "$*"; exit 1; }
-strip_ansi() {
-    local line
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        strip_escapes "$line"
-        printf '\n'
-    done
+banner() { printf '\n%s=== %s ===%s\n' "$BOLD$CYAN" "$*" "$RESET" >&2; }
+info() { printf '%s[*]%s %s\n' "$CYAN" "$RESET" "$*" >&2; }
+ok() { printf '%s[OK]%s %s\n' "$GREEN" "$RESET" "$*" >&2; }
+warn() { printf '%s[!]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+err() { printf '%s[ERROR]%s %s\n' "$RED" "$RESET" "$*" >&2; }
+clear_screen() { clear >&2 2>/dev/null || :; }
+
+die() {
+    err "$*"
+    if [[ -n "$LOG_FILE" ]]; then
+        printf 'ERROR [%s]: %s\n' "$CURRENT_STAGE" "$*" >> "$LOG_FILE" 2>/dev/null || :
+        warn "Stage: $CURRENT_STAGE | Installer: $INSTALLER_VERSION | Log: $LOG_FILE"
+    fi
+    if (( DISK_CHANGED == 0 )); then
+        warn "No disk changes were made by this run."
+    else
+        warn "The selected disk has already been modified. Do not assume installation finished."
+    fi
+    exit 1
 }
+require_root() { [[ $EUID -eq 0 ]] || die "Run this installer as root."; }
 
-require_root() { [[ $EUID -eq 0 ]] || die "Run as root."; }
-
-trap 'echo; err "Interrupted."; exit 130' INT TERM
-
-[[ -f /etc/xyloos/dialogrc ]] && export DIALOGRC=/etc/xyloos/dialogrc
 HAVE_DIALOG=0
-command -v dialog &>/dev/null && HAVE_DIALOG=1
+command -v dialog >/dev/null 2>&1 && HAVE_DIALOG=1
+[[ -f /etc/xyloos/dialogrc ]] && export DIALOGRC=/etc/xyloos/dialogrc
 
-# Strip carriage returns and leading/trailing whitespace from anything
-# captured from dialog. On some terminals/hardware dialog's output can
-# pick up trailing control characters that are invisible when printed
-# but break exact string/case matching later — this was the root cause
-# of desktop selection silently failing to match even a visually-correct
-# choice like "gnome". Every dialog capture below is piped through this.
-# Strip ANY ANSI/VT100 terminal escape sequence (ESC [ ... terminator)
-# wherever it appears in a string, using only bash's own builtin regex
-# engine — no external sed/grep call. Confirmed via a hex dump of a real
-# failure that dialog's captured output can come back with terminal
-# control codes stuck to the front of an otherwise completely correct
-# selection (e.g. literal bytes ESC[@ ESC[J ESC[3J immediately before
-# "gnome"). Two earlier fix attempts (removing dialog's --clear flag,
-# then an external `sed -E` strip) both failed to actually stop this on
-# the real hardware despite working in testing — moving to a pure-bash
-# implementation removes any dependency on external tool behavior or
-# locale-sensitive regex handling that could explain that gap.
-strip_escapes() {
-    local s="$1" esc out=""
-    esc=$(printf '\x1b')
-    # Single left-to-right pass using only parameter expansion (no regex
-    # re-matching against a shrinking string each iteration) — the
-    # previous implementation was effectively O(n^2) and took several
-    # seconds on a synthetic worst-case input far larger than anything
-    # observed so far, but there's no reason to leave that cliff in
-    # place when a linear-time version is just as simple to write.
-    while [[ "$s" == *"$esc"* ]]; do
-        out+="${s%%"$esc"*}"
-        s="${s#*"$esc"}"
-        if [[ "$s" == "["* ]]; then
-            s="${s#\[}"
-            while [[ "$s" == [0-9\;]* ]]; do
-                s="${s:1}"
-            done
-            [[ -n "$s" ]] && s="${s:1}"
+# Keep --stdout, the working dialog capture method. The important repair is
+# that clear (and all diagnostic messages) goes to STDERR, never to the
+# command substitution containing the selected tag. No guessing/stripping
+# answers, temporary output descriptors, or keyboard-buffer draining.
+dialog_value() {
+    local answer="" rc=0
+    (( HAVE_DIALOG == 1 )) || return 127
+    if answer=$(DIALOG_OK=0 DIALOG_CANCEL=1 DIALOG_ESC=255 DIALOG_ERROR=2 \
+        dialog --stdout --backtitle "xyloOS Installer | $INSTALLER_VERSION" "$@"); then
+        rc=0
+    else
+        rc=$?
+    fi
+    clear_screen
+    (( rc == 0 )) || return "$rc"
+    printf '%s' "$answer"
+}
+
+menu_pick() {
+    local title="$1" prompt="$2" h="$3" w="$4" mh="$5"
+    shift 5
+    local answer="" rc=0
+    local -a items=("$@")
+    (( ${#items[@]} > 0 && ${#items[@]} % 2 == 0 )) || return 64
+    answer=$(dialog_value --title "$title" --menu "$prompt" "$h" "$w" "$mh" "${items[@]}") || rc=$?
+    (( rc == 0 )) || return "$rc"
+    local i=0
+    for ((i=0; i<${#items[@]}; i+=2)); do
+        if [[ "$answer" == "${items[i]}" ]]; then
+            printf '%s' "$answer"
+            return 0
         fi
     done
-    out+="$s"
-    printf '%s' "$out"
-}
-
-# Bound an input's length before strip_escapes touches it, regardless of
-# how much contamination a capture theoretically contains — no
-# legitimate answer anywhere in this wizard (username, password, SSID,
-# disk path, DE tag, region/city name) is ever more than a couple
-# hundred characters, and observed contamination consistently puts the
-# real answer at the END of the noise. A naive fixed-length truncation
-# can cut an escape sequence in half, leaving an unparseable fragment
-# stuck to the front of the result — so this truncates to the LAST
-# escape sequence found within the tail window instead, guaranteeing
-# every kept byte starts from a clean boundary.
-bound_length() {
-    local s="$1"
-    if [[ ${#s} -gt 300 ]]; then
-        local tail="${s: -300}" esc
-        esc=$(printf '\x1b')
-        if [[ "$tail" == *"$esc"* ]]; then
-            s="${esc}${tail##*"$esc"}"
-        else
-            s="$tail"
-        fi
+    err "The menu returned an invalid answer; it was rejected, not guessed."
+    if [[ -n "$LOG_FILE" ]]; then
+        printf 'Invalid menu answer (%s), hex: ' "$title" >> "$LOG_FILE"
+        printf '%s' "$answer" | od -An -tx1 >> "$LOG_FILE"
     fi
-    printf '%s' "$s"
+    return 65
 }
 
-clean_choice() {
-    local s="$1"
-    s="$(bound_length "$s")"
-    s="$(strip_escapes "$s")"
-    s="${s//$'\r'/}"
-    s="${s#"${s%%[![:space:]]*}"}"
-    s="${s%"${s##*[![:space:]]}"}"
-    printf '%s' "$s"
+selection_failed() {
+    local rc="$1" screen="$2"
+    case "$rc" in
+        1|255) die "Installation cancelled at: $screen." ;;
+        *) die "Could not read $screen (dialog status $rc)." ;;
+    esac
 }
 
-# Small helper: yes/no confirm, dialog when available, plain read as a
-# last-resort fallback (only reachable if dialog is somehow missing).
 confirm() {
-    local prompt="$1"
-    if [[ $HAVE_DIALOG -eq 1 ]]; then
-        drain_stale_input
-        dialog --stdout --backtitle "xyloOS Installer" --title "Confirm" \
-            --yesno "$prompt" 12 66
-        local rc=$?
-        clear
-        [[ $rc -eq 0 ]] && return 0 || return 1
-    fi
-    local ans
-    read -rp "$prompt [y/N] " ans
-    [[ "$ans" =~ ^[Yy] ]]
+    local rc=0
+    dialog_value --title "Confirm" --defaultno --yesno "$1" 0 76 || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1|255) return 1 ;;
+        *) die "Could not display the confirmation (dialog status $rc)." ;;
+    esac
 }
 
-# Small helper: single-line menu, dialog when available.
-menu_pick() {
-    # $1=title  $2=prompt  $3=height  $4=width  $5=menu-height  then tag/desc pairs...
-    local title="$1" prompt="$2" h="$3" w="$4" mh="$5"; shift 5
-    if [[ $HAVE_DIALOG -eq 1 ]]; then
-        local out
-        drain_stale_input
-        out=$(dialog --stdout --backtitle "xyloOS Installer" --title "$title" \
-            --menu "$prompt" "$h" "$w" "$mh" "$@")
-        clear
-        printf '%s' "$(clean_choice "$out")"
-        return 0
-    fi
-    return 1
-}
+# Only for iwctl's decorative table output, NEVER for menu tags/passwords.
+strip_ansi() { sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g; s/\r//g'; }
 
 TARGET_DISK=""
+TARGET_ID=""
+TARGET_DESCRIPTION=""
+ROOT_PART=""
+ESP_PART=""
 XYLO_USER=""
 XYLO_PASS=""
 TIMEZONE="UTC"
@@ -192,10 +117,111 @@ DE_LABEL="Minimal CLI Only"
 DE_MODE="none"
 WM_EXEC=""
 BUILD_DWM_FROM_SOURCE=""
+BOOT_MODE=""
+RUN_DIR=""
+LOG_FILE=""
+CURRENT_STAGE="startup"
+MOUNTED_ROOT=0
+DISK_CHANGED=0
+PACKAGES_CHECKED=0
+INSTALL_TARGETS=()
+BOOT_DISKS=()
+OFFERED_DISKS=()
 
-# ---------------------------------------------------------------------
-# Step 1: Language
-# ---------------------------------------------------------------------
+run_logged() {
+    local label="$1" rc=0
+    shift
+    info "$label"
+    if "$@" 2>&1 | tee -a "$LOG_FILE"; then
+        return 0
+    else
+        rc=$?
+    fi
+    die "$label failed (exit $rc). See the error immediately above."
+}
+
+copy_install_log() {
+    if (( MOUNTED_ROOT == 1 )) && [[ -f "$LOG_FILE" && -d /mnt/var/log ]]; then
+        cp -- "$LOG_FILE" /mnt/var/log/xylo-installer.log 2>/dev/null || :
+        chmod 600 /mnt/var/log/xylo-installer.log 2>/dev/null || :
+    fi
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    XYLO_PASS=""
+    if (( MOUNTED_ROOT == 1 )); then
+        copy_install_log
+        if ! umount -R /mnt; then
+            warn "Could not unmount /mnt. Do not unplug the target while it is mounted."
+            (( rc == 0 )) && rc=1
+        fi
+    fi
+    if [[ -n "$RUN_DIR" && "$RUN_DIR" == /tmp/xylo-installer.* ]]; then
+        rm -rf -- "$RUN_DIR"
+    fi
+    exit "$rc"
+}
+
+# A real transaction preview with an EMPTY local database avoids treating
+# packages already present on the live ISO as installed on the new system.
+# pacman -Sp understands BOTH package names and groups such as xfce4/mate.
+step_preflight() {
+    CURRENT_STAGE="pre-install checks"
+    banner "Checking installation requirements (no disk changes yet)"
+    local tool=""
+    for tool in pacman pacstrap arch-chroot genfstab parted partprobe wipefs \
+        mkfs.fat mkfs.ext4 mount umount mountpoint findmnt lsblk findfs \
+        udevadm readlink tee install flock; do
+        command -v "$tool" >/dev/null 2>&1 || die "The live ISO is missing required tool: $tool"
+    done
+    [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || die "Invalid timezone: $TIMEZONE"
+    [[ "$XYLO_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$XYLO_USER" != root ]] \
+        || die "Invalid username."
+    [[ -n "$XYLO_PASS" && "$XYLO_PASS" != *$'\n'* && "$XYLO_PASS" != *$'\r'* ]] \
+        || die "A nonempty password without newline characters is required."
+    local mounts=""
+    mounts=$(findmnt -rn -o TARGET) || die "Could not inspect current mounts."
+    if printf '%s\n' "$mounts" | grep -Eq '^/mnt(/|$)'; then
+        die "/mnt already contains mounted filesystems. Reboot the live USB before retrying."
+    fi
+    [[ ! -L /mnt ]] || die "/mnt must not be a symbolic link."
+    BOOT_MODE=bios
+    [[ -d /sys/firmware/efi ]] && BOOT_MODE=uefi
+
+    INSTALL_TARGETS=(base linux linux-firmware mkinitcpio sudo networkmanager
+        wpa_supplicant iwd grub efibootmgr dosfstools e2fsprogs vim nano dialog
+        fastfetch mesa vulkan-icd-loader)
+    local -a desktop_targets=()
+    read -r -a desktop_targets <<< "$DE_PKGS"
+    INSTALL_TARGETS+=("${desktop_targets[@]}")
+    if [[ "$DE_MODE" != none ]]; then
+        INSTALL_TARGETS+=(pipewire pipewire-alsa pipewire-pulse wireplumber
+            ttf-dejavu noto-fonts noto-fonts-emoji vulkan-radeon vulkan-intel)
+    fi
+    if grep -q GenuineIntel /proc/cpuinfo; then
+        INSTALL_TARGETS+=(intel-ucode)
+    elif grep -q AuthenticAMD /proc/cpuinfo; then
+        INSTALL_TARGETS+=(amd-ucode)
+    fi
+    run_logged "Refreshing package databases" pacman -Sy --noconfirm
+    local db="$RUN_DIR/package-check"
+    mkdir -p "$db/local" "$db/sync" || die "Could not prepare package checks."
+    cp -a /var/lib/pacman/sync/. "$db/sync/" || die "Could not copy package databases."
+    run_logged "Checking all packages and groups for $DE_LABEL" \
+        pacman --dbpath "$db" -S --print --noconfirm --print-format '%n' "${INSTALL_TARGETS[@]}"
+    if [[ "$BUILD_DWM_FROM_SOURCE" == 1 ]]; then
+        command -v git >/dev/null 2>&1 || die "git is required for the dwm option."
+        run_logged "Fetching dwm source before any disk is erased" \
+            git clone --depth 1 https://git.suckless.org/dwm "$RUN_DIR/dwm"
+        git -C "$RUN_DIR/dwm" rev-parse HEAD >> "$LOG_FILE" || die "Could not verify dwm source."
+    fi
+    PACKAGES_CHECKED=1
+    ok "Package checks passed. Boot mode: $BOOT_MODE. No disk has been erased."
+}
+
+
 step_lang() {
     banner "STEP 1: Language"
     local choice
@@ -215,7 +241,7 @@ step_lang() {
         "ko_KR" "Korean" \
         "nl_NL" "Nederlands (Dutch)" \
         "pl_PL" "Polski (Polish)" \
-        "tr_TR" "Turkce (Turkish)")
+        "tr_TR" "Turkce (Turkish)") || selection_failed "$?" "language selection"
 
     case "$choice" in
         en_US) LOCALE="en_US.UTF-8"; LANG_LABEL="English (US)" ;;
@@ -234,14 +260,11 @@ step_lang() {
         nl_NL) LOCALE="nl_NL.UTF-8"; LANG_LABEL="Nederlands (Dutch)" ;;
         pl_PL) LOCALE="pl_PL.UTF-8"; LANG_LABEL="Polski (Polish)" ;;
         tr_TR) LOCALE="tr_TR.UTF-8"; LANG_LABEL="Turkce (Turkish)" ;;
-        *) LOCALE="en_US.UTF-8"; LANG_LABEL="English (US)" ;;
+        *) die "Invalid language selection." ;;
     esac
     ok "Language set to $LANG_LABEL"
 }
 
-# ---------------------------------------------------------------------
-# Step 2: Wi-Fi / Network
-# ---------------------------------------------------------------------
 step_wifi() {
     banner "STEP 2: Network Connectivity"
     if ping -c1 -W2 archlinux.org &>/dev/null; then
@@ -318,13 +341,11 @@ step_wifi() {
                 menu_items+=("$s" "")
             done
             menu_items+=("(Enter SSID manually)" "")
-            drain_stale_input
-            ssid=$(dialog --stdout --backtitle "xyloOS Installer" \
-                --title "Select Wi-Fi Network" \
-                --menu "Use Up/Down arrows and Enter to select:" 20 60 12 \
-                "${menu_items[@]}")
-            ssid=$(clean_choice "$ssid")
-            clear
+
+            ssid=$(menu_pick "Select Wi-Fi Network" \
+                "Use Up/Down arrows and Enter to select:" 20 60 12 \
+                "${menu_items[@]}") || { warn "Wi-Fi selection cancelled or unavailable."; return 1; }
+            clear_screen
             [[ "$ssid" == "(Enter SSID manually)" ]] && ssid=""
         fi
 
@@ -339,16 +360,13 @@ step_wifi() {
             if confirm "Try Wi-Fi setup again?"; then continue; else return 1; fi
         fi
 
-        local pass
+        local pass=""
         if [[ $HAVE_DIALOG -eq 1 ]]; then
-            drain_stale_input
-            pass=$(dialog --stdout --backtitle "xyloOS Installer" \
+
+            pass=$(dialog_value \
                 --title "Wi-Fi Password" \
-                --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60)
-            pass="$(bound_length "$pass")"
-            pass="$(strip_escapes "$pass")"
-            pass="${pass//$'\r'/}"
-            clear
+                --insecure --passwordbox "Password for '$ssid' (leave blank for open network):" 10 60) || { warn "Wi-Fi password entry cancelled or unavailable."; return 1; }
+            clear_screen
         else
             read -rsp "Password for '$ssid' (blank = open network): " pass; echo
         fi
@@ -360,9 +378,10 @@ step_wifi() {
             iwctl station "$dev" connect "$ssid"
         fi
 
+        pass=""
         local linked=""
         for _ in 1 2 3 4 5 6; do
-            if iwctl station "$dev" show 2>/dev/null | grep -qi "State.*connected"; then
+            if iwctl station "$dev" show 2>/dev/null | grep -Eqi 'State[[:space:]]+connected([[:space:]]|$)'; then
                 linked=1
                 break
             fi
@@ -395,216 +414,103 @@ step_wifi() {
 }
 
 # ---------------------------------------------------------------------
-# Step 3: Region & Timezone
+# Step 3: Region and timezone. Preserve nested paths (e.g. Indiana/...).
 # ---------------------------------------------------------------------
 step_timezone() {
     banner "STEP 3: Region & Timezone"
+    local region="" city="" r="" c=""
+    local -a regions=() cities=() items=(UTC "Coordinated Universal Time")
     mapfile -t regions < <(find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 -type d \
         -printf '%f\n' | grep -Ev '^(posix|right|Etc|SystemV)$' | sort)
-
-    local region="" attempts=0
-    while true; do
-        if [[ $HAVE_DIALOG -eq 1 ]]; then
-            local menu_items=()
-            for r in "${regions[@]}"; do
-                menu_items+=("$r" "")
-            done
-            drain_stale_input
-            region=$(dialog --stdout --backtitle "xyloOS Installer" \
-                --title "Select Region" \
-                --menu "Use Up/Down arrows and Enter to select:" 22 50 15 \
-                "${menu_items[@]}")
-            region=$(clean_choice "$region")
-            clear
-            # Safety net matching step_disk()'s pattern: only accept an
-            # EXACT match against a known-real region, or one found as a
-            # substring within whatever was captured (tolerates leftover
-            # contamination) — never fall through on an unvalidated value.
-            if [[ -n "$region" ]]; then
-                local valid_hit=""
-                for r in "${regions[@]}"; do
-                    if [[ "$region" == "$r" || "$region" == *"$r"* ]]; then
-                        valid_hit="$r"
-                        break
-                    fi
-                done
-                region="$valid_hit"
-            fi
-        fi
-        [[ -n "$region" ]] && break
-        ((attempts++))
-        if [[ $attempts -ge 3 ]]; then
-            die "No valid region was selected after ${attempts} attempts. Tell Claude if this recurs."
-        fi
-        warn "No valid region selected. Please try again (attempt ${attempts}/3)."
-    done
-
-    mapfile -t cities < <(find "/usr/share/zoneinfo/$region" -type f -printf '%f\n' | sort)
-    local city="" city_attempts=0
-    while true; do
-        if [[ $HAVE_DIALOG -eq 1 ]]; then
-            local menu_items=()
-            for c in "${cities[@]}"; do
-                menu_items+=("$c" "")
-            done
-            drain_stale_input
-            city=$(dialog --stdout --backtitle "xyloOS Installer" \
-                --title "Select City / Timezone ($region)" \
-                --menu "Use Up/Down arrows and Enter to select:" 22 60 15 \
-                "${menu_items[@]}")
-            city=$(clean_choice "$city")
-            clear
-            if [[ -n "$city" ]]; then
-                local valid_hit=""
-                for c in "${cities[@]}"; do
-                    if [[ "$city" == "$c" || "$city" == *"$c"* ]]; then
-                        valid_hit="$c"
-                        break
-                    fi
-                done
-                city="$valid_hit"
-            fi
-        fi
-        [[ -n "$city" ]] && break
-        ((city_attempts++))
-        if [[ $city_attempts -ge 3 ]]; then
-            die "No valid city was selected after ${city_attempts} attempts. Tell Claude if this recurs."
-        fi
-        warn "No valid city selected. Please try again (attempt ${city_attempts}/3)."
-    done
-
-    TIMEZONE="$region/$city"
-    timedatectl set-ntp true 2>/dev/null || true
-    ok "Timezone set to $TIMEZONE (clock will sync via NTP)."
+    for r in "${regions[@]}"; do items+=("$r" ""); done
+    region=$(menu_pick "Select Region" "Choose your region:" 22 60 15 "${items[@]}") \
+        || selection_failed "$?" "region selection"
+    if [[ "$region" == UTC ]]; then
+        TIMEZONE=UTC
+    else
+        mapfile -t cities < <(find "/usr/share/zoneinfo/$region" \( -type f -o -type l \) -printf '%P\n' | sort)
+        items=()
+        for c in "${cities[@]}"; do
+            [[ -f "/usr/share/zoneinfo/$region/$c" ]] && items+=("$c" "")
+        done
+        (( ${#items[@]} > 0 )) || die "No timezones found for $region."
+        city=$(menu_pick "Select City / Timezone ($region)" "Choose your city/timezone:" \
+            22 66 15 "${items[@]}") || selection_failed "$?" "timezone selection"
+        TIMEZONE="$region/$city"
+    fi
+    [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || die "Timezone file does not exist: $TIMEZONE"
+    timedatectl set-ntp true 2>/dev/null || :
+    ok "Timezone set to $TIMEZONE."
 }
 
 # ---------------------------------------------------------------------
-# Step 4: User account
+# Step 4: User. Passwords are kept verbatim and never inserted into code.
 # ---------------------------------------------------------------------
 step_user() {
     banner "STEP 4: User Account"
     while true; do
-        if [[ $HAVE_DIALOG -eq 1 ]]; then
-            drain_stale_input
-            XYLO_USER=$(dialog --stdout --backtitle "xyloOS Installer" --title "User Account" \
-                --inputbox "Choose a username (lowercase, no spaces):" 10 60)
-            XYLO_USER=$(clean_choice "$XYLO_USER")
-            clear
-        else
-            read -rp "Choose a username: " XYLO_USER
+        XYLO_USER=$(dialog_value --title "User Account" \
+            --inputbox "Choose a username (lowercase, no spaces, maximum 32 characters):" 11 68) \
+            || selection_failed "$?" "username entry"
+        if [[ "$XYLO_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$XYLO_USER" != root ]] \
+            && ! getent passwd "$XYLO_USER" >/dev/null && ! getent group "$XYLO_USER" >/dev/null; then
+            break
         fi
-        [[ "$XYLO_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && break
-        warn "Usernames must be lowercase, start with a letter/underscore, no spaces."
+        warn "Use a new lowercase username, maximum 32 characters. Reserved/system names are not allowed."
     done
+    local pw1="" pw2=""
     while true; do
-        local pw1 pw2
-        if [[ $HAVE_DIALOG -eq 1 ]]; then
-            drain_stale_input
-            pw1=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
-                --insecure --passwordbox "Enter password for $XYLO_USER:" 10 60)
-            pw1="$(bound_length "$pw1")"
-            pw1="$(strip_escapes "$pw1")"
-            pw1="${pw1//$'\r'/}"
-            clear
-            drain_stale_input
-            pw2=$(dialog --stdout --backtitle "xyloOS Installer" --title "Password" \
-                --insecure --passwordbox "Confirm password:" 10 60)
-            pw2="$(bound_length "$pw2")"
-            pw2="$(strip_escapes "$pw2")"
-            pw2="${pw2//$'\r'/}"
-            clear
+        pw1=$(dialog_value --title "Password" --insecure \
+            --passwordbox "Enter password for $XYLO_USER:" 10 66) || selection_failed "$?" "password entry"
+        pw2=$(dialog_value --title "Confirm Password" --insecure \
+            --passwordbox "Enter the same password again:" 10 66) || selection_failed "$?" "password confirmation"
+        if [[ -z "$pw1" || "$pw1" == *$'\n'* || "$pw1" == *$'\r'* ]]; then
+            warn "Enter a nonempty password without newline characters."
+        elif [[ "$pw1" != "$pw2" ]]; then
+            warn "Passwords did not match. Please try again."
         else
-            read -rsp "Enter password: " pw1; echo
-            read -rsp "Confirm password: " pw2; echo
+            XYLO_PASS="$pw1"
+            pw1=""; pw2=""
+            break
         fi
-        if [[ -z "$pw1" ]]; then warn "Password cannot be empty."
-        elif [[ "$pw1" != "$pw2" ]]; then warn "Passwords did not match, try again."
-        else XYLO_PASS="$pw1"; break; fi
     done
     ok "User '$XYLO_USER' will be created with sudo privileges."
 }
 
-# ---------------------------------------------------------------------
-# Step 5: Desktop environment / window manager
-# ---------------------------------------------------------------------
+
 step_de() {
     banner "STEP 5: Desktop Environment / Window Manager"
-
-    local choice="" attempts=0
-    while true; do
-        choice=$(menu_pick "Desktop Environment / Window Manager" \
-            "Use Up/Down arrows and Enter to select:" 23 66 16 \
-            "gnome"      "GNOME (GDM)" \
-            "kde"        "KDE Plasma (SDDM)" \
-            "xfce"       "Xfce (LightDM)" \
-            "mate"       "MATE (LightDM)" \
-            "cinnamon"   "Cinnamon (LightDM)" \
-            "lxqt"       "LXQt (SDDM)" \
-            "lxde"       "LXDE (LightDM)" \
-            "budgie"     "Budgie (LightDM)" \
-            "hyprland"   "Hyprland (Wayland tiling WM)" \
-            "sway"       "Sway (Wayland tiling WM)" \
-            "i3"         "i3 (X11 tiling WM)" \
-            "bspwm"      "bspwm (X11 tiling WM)" \
-            "awesome"    "Awesome (X11 tiling WM)" \
-            "xmonad"     "Xmonad (X11 tiling WM)" \
-            "herbstluftwm" "herbstluftwm (X11 tiling WM)" \
-            "dwm"        "dwm (X11 tiling WM)" \
-            "none"       "Minimal CLI Only (no desktop)")
-
-        if [[ -z "$choice" && $HAVE_DIALOG -ne 1 ]]; then
-            cat <<'MENU'
-  [1]  GNOME            [2]  KDE Plasma       [3]  Xfce
-  [4]  MATE             [5]  Cinnamon         [6]  LXQt
-  [7]  LXDE             [8]  Budgie           [9]  Hyprland
-  [10] Sway             [11] i3               [12] bspwm
-  [13] Awesome          [14] Xmonad           [15] herbstluftwm
-  [16] dwm              [17] Minimal CLI Only
-MENU
-            local n
-            read -rp "Choose [1-17]: " n
-            local names=(gnome kde xfce mate cinnamon lxqt lxde budgie hyprland sway i3 bspwm awesome xmonad herbstluftwm dwm none)
-            choice="${names[$((n-1))]:-}"
-        fi
-
-        case "$choice" in
-            gnome|kde|xfce|mate|cinnamon|lxqt|lxde|budgie|hyprland|sway|i3|bspwm|awesome|xmonad|herbstluftwm|dwm|none|"")
-                break
-                ;;
-            *herbstluftwm*) choice="herbstluftwm"; break ;;
-            *hyprland*)     choice="hyprland";     break ;;
-            *cinnamon*)     choice="cinnamon";     break ;;
-            *budgie*)       choice="budgie";       break ;;
-            *awesome*)      choice="awesome";      break ;;
-            *xmonad*)       choice="xmonad";       break ;;
-            *bspwm*)        choice="bspwm";        break ;;
-            *gnome*)        choice="gnome";        break ;;
-            *lxqt*)         choice="lxqt";         break ;;
-            *lxde*)         choice="lxde";         break ;;
-            *xfce*)         choice="xfce";         break ;;
-            *mate*)         choice="mate";         break ;;
-            *sway*)         choice="sway";         break ;;
-            *kde*)          choice="kde";          break ;;
-            *dwm*)          choice="dwm";          break ;;
-            *i3*)           choice="i3";           break ;;
-            *none*)         choice="none";         break ;;
-            *)
-                ((attempts++))
-                if [[ $attempts -ge 3 ]]; then
-                    die "Unrecognized desktop selection. Raw hex bytes of what was captured: [$(printf '%s' "$choice" | od -An -tx1 | tr -s ' \n' ' ')] (length ${#choice} chars) — tell Claude this exact bracketed hex string."
-                fi
-                warn "Unrecognized selection (hex: [$(printf '%s' "$choice" | od -An -tx1 | tr -s ' \n' ' ')]). Please try again (attempt ${attempts}/3)."
-                ;;
-        esac
-    done
+    local choice=""
+    choice=$(menu_pick "Desktop Environment / Window Manager" \
+        "Use Up/Down arrows and Enter to select:" 23 66 16 \
+        "gnome"      "GNOME (GDM)" \
+        "kde"        "KDE Plasma (SDDM)" \
+        "xfce"       "Xfce (LightDM)" \
+        "mate"       "MATE (LightDM)" \
+        "cinnamon"   "Cinnamon (LightDM)" \
+        "lxqt"       "LXQt (SDDM)" \
+        "lxde"       "LXDE (LightDM)" \
+        "budgie"     "Budgie (LightDM)" \
+        "hyprland"   "Hyprland (Wayland tiling WM)" \
+        "sway"       "Sway (Wayland tiling WM)" \
+        "i3"         "i3 (X11 tiling WM)" \
+        "bspwm"      "bspwm (X11 tiling WM)" \
+        "awesome"    "Awesome (X11 tiling WM)" \
+        "xmonad"     "Xmonad (X11 tiling WM)" \
+        "herbstluftwm" "herbstluftwm (X11 tiling WM)" \
+        "dwm"        "dwm (X11 tiling WM)" \
+        "none"       "Minimal CLI Only (no desktop)") || selection_failed "$?" "desktop selection"
 
     # DE_MODE: "dm" (has a display manager) / "wm-x11" / "wm-wayland" / "none"
     DE_MODE="dm"
+    DE_SERVICE=""
+    DE_PKGS=""
+    BUILD_DWM_FROM_SOURCE=""
     WM_EXEC=""
     local XORG_BASE="xorg-server xorg-xinit xterm"
     case "$choice" in
-        gnome)    DE_PKGS="gnome-shell gnome-control-center nautilus gnome-terminal gdm"; DE_SERVICE="gdm"; DE_LABEL="GNOME" ;;
-        kde)      DE_PKGS="plasma-desktop sddm konsole dolphin"; DE_SERVICE="sddm"; DE_LABEL="KDE Plasma" ;;
+        gnome)    DE_PKGS="gnome-shell gnome-session gnome-settings-daemon gnome-control-center nautilus gnome-terminal gdm"; DE_SERVICE="gdm"; DE_LABEL="GNOME" ;;
+        kde)      DE_PKGS="plasma-meta sddm konsole dolphin"; DE_SERVICE="sddm"; DE_LABEL="KDE Plasma" ;;
         xfce)     DE_PKGS="xfce4 xfce4-goodies lightdm lightdm-gtk-greeter"; DE_SERVICE="lightdm"; DE_LABEL="Xfce" ;;
         mate)     DE_PKGS="mate mate-extra lightdm lightdm-gtk-greeter"; DE_SERVICE="lightdm"; DE_LABEL="MATE" ;;
         cinnamon) DE_PKGS="cinnamon lightdm lightdm-gtk-greeter"; DE_SERVICE="lightdm"; DE_LABEL="Cinnamon" ;;
@@ -650,185 +556,300 @@ MENU
             WM_EXEC="exec dwm"; DE_LABEL="dwm (built from source)"
             BUILD_DWM_FROM_SOURCE=1
             ;;
-        none|"") DE_MODE="none"; DE_PKGS=""; DE_SERVICE=""; DE_LABEL="Minimal CLI Only" ;;
+        none) DE_MODE="none"; DE_PKGS=""; DE_SERVICE=""; DE_LABEL="Minimal CLI Only" ;;
+        *) die "Invalid desktop selection." ;;
     esac
+    # LightDM and other display managers do not guarantee that an X server
+    # will be installed merely because it exists on the live ISO.
+    if [[ "$DE_MODE" == dm ]]; then DE_PKGS="xorg-server $DE_PKGS"; fi
     ok "Desktop selection: $DE_LABEL"
 }
 
 # ---------------------------------------------------------------------
-# Step 6: Target drive (last step before install)
+# Storage discovery: fail closed; never guess a disk from a substring.
 # ---------------------------------------------------------------------
-step_disk() {
-    banner "STEP 6: Target Installation Drive"
-    echo
+is_block_device() { [[ -b "$1" ]]; }
 
-    # Never let the boot medium itself show up as an install target.
-    # archiso mounts the live medium at /run/archiso/bootmnt.
-    local boot_part boot_disk
-    boot_part=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null)
-    if [[ -n "$boot_part" ]]; then
-        boot_disk=$(lsblk -no PKNAME "$boot_part" 2>/dev/null)
-    fi
-
-    declare -gA disk_map=()
-    local i=1 d size model
-    mapfile -t disks < <(lsblk -dn -e7,11 -o NAME,TYPE,SIZE | awk '$2=="disk" && $3!="0B"{print $1}')
-    [[ ${#disks[@]} -gt 0 ]] || die "No storage drives detected."
-
-    local menu_items=()
-    for d in "${disks[@]}"; do
-        if [[ -n "$boot_disk" && "$d" == "$boot_disk" ]]; then
-            continue
-        fi
-        size=$(lsblk -dn -o SIZE "/dev/$d")
-        model=$(lsblk -dn -o MODEL "/dev/$d" 2>/dev/null)
-        menu_items+=("/dev/$d" "$size  $model")
-        disk_map[$i]="/dev/$d"
-        ((i++))
-    done
-    if [[ -n "$boot_disk" ]]; then
-        info "(/dev/$boot_disk — your xyloOS boot drive — is hidden from this list for safety)"
-    fi
-    [[ ${#menu_items[@]} -gt 0 ]] || die "No installable drives found (only the boot USB was detected)."
-
-    local attempts=0
-    while true; do
-        TARGET_DISK=""
-        if [[ $HAVE_DIALOG -eq 1 ]]; then
-            drain_stale_input
-            TARGET_DISK=$(dialog --stdout --backtitle "xyloOS Installer" \
-                --title "Select Target Drive" \
-                --menu "Use Up/Down arrows and Enter to select. ALL DATA on the chosen drive will be erased." \
-                18 60 8 "${menu_items[@]}")
-            TARGET_DISK=$(clean_choice "$TARGET_DISK")
-            clear
-            # Safety net: only accept an EXACT match against a genuinely
-            # known disk, or one found as a substring within whatever was
-            # captured (tolerates leftover contamination) — the value is
-            # unconditionally overwritten either way, so an unrecognized
-            # or garbled capture is correctly cleared to empty and caught
-            # by the retry check below, instead of silently surviving
-            # into the destructive disk commands later in this function.
-            if [[ -n "$TARGET_DISK" ]]; then
-                local valid_hit=""
-                for d in "${disks[@]}"; do
-                    [[ -n "$boot_disk" && "$d" == "$boot_disk" ]] && continue
-                    if [[ "$TARGET_DISK" == "/dev/$d" || "$TARGET_DISK" == *"/dev/$d"* ]]; then
-                        valid_hit="/dev/$d"
-                        break
-                    fi
-                done
-                TARGET_DISK="$valid_hit"
-            fi
-        fi
-        [[ -n "$TARGET_DISK" ]] && break
-        ((attempts++))
-        if [[ $attempts -ge 3 ]]; then
-            die "No drive was selected after ${attempts} attempts (dialog kept returning empty — if you were pressing Cancel/Esc, that's why; otherwise this points to a real bug, tell Claude)."
-        fi
-        warn "No drive selected. Please try again (attempt ${attempts}/3)."
-    done
-
-    if ! confirm "ALL DATA ON $TARGET_DISK WILL BE PERMANENTLY ERASED.\n\nErase $TARGET_DISK and continue?"; then
-        die "Cancelled — nothing was erased."
-    fi
-    ok "Target drive set to $TARGET_DISK"
+protect_boot_source() {
+    local source="$1" depth="${2:-0}" rows="" device="" kind="" found=0
+    (( depth < 5 )) || return 1
+    source="${source%%\[*}"
+    source=$(readlink -f -- "$source") || return 1
+    is_block_device "$source" || return 1
+    rows=$(lsblk -s -n -r -p -o NAME,TYPE -- "$source" 2>/dev/null) || return 1
+    while read -r device kind; do
+        case "$kind" in
+            disk)
+                BOOT_DISKS+=("$device")
+                found=1
+                ;;
+            rom)
+                # Optical drives are not offered as target disks.
+                found=1
+                ;;
+            loop)
+                local backing="" parent=""
+                backing=$(losetup -l -n -O BACK-FILE -- "$device" 2>/dev/null) || return 1
+                [[ -n "$backing" && -f "$backing" ]] || return 1
+                parent=$(findmnt -rn -e -o SOURCE -T "$backing" 2>/dev/null) || return 1
+                protect_boot_source "$parent" "$((depth + 1))" || return 1
+                found=1
+                ;;
+        esac
+    done <<< "$rows"
+    (( found == 1 ))
 }
 
-# ---------------------------------------------------------------------
-# Post-selection automation
-# ---------------------------------------------------------------------
-step_install() {
-    banner "Partitioning $TARGET_DISK"
-    wipefs -af "$TARGET_DISK" || true
-    parted -s "$TARGET_DISK" mklabel gpt
-    parted -s "$TARGET_DISK" mkpart ESP fat32 1MiB 513MiB
-    parted -s "$TARGET_DISK" set 1 esp on
-    parted -s "$TARGET_DISK" mkpart primary ext4 513MiB 100%
-    partprobe "$TARGET_DISK" 2>/dev/null || true
-    sleep 1
-
-    local esp root
-    if [[ "$TARGET_DISK" =~ nvme|mmcblk ]]; then
-        esp="${TARGET_DISK}p1"; root="${TARGET_DISK}p2"
-    else
-        esp="${TARGET_DISK}1"; root="${TARGET_DISK}2"
-    fi
-
-    info "Formatting $esp as FAT32 (EFI System Partition)..."
-    mkfs.fat -F32 "$esp"
-    info "Formatting $root as ext4 (root)..."
-    mkfs.ext4 -F "$root"
-
-    mount "$root" /mnt
-    mkdir -p /mnt/boot/efi
-    mount "$esp" /mnt/boot/efi
-
-    # Verify every package in the selected set actually exists on your
-    # mirrors before committing to the install — this is the safety net
-    # for the package-name uncertainty noted at the top of this script.
-    if [[ -n "$DE_PKGS" ]]; then
-        info "Checking package availability for $DE_LABEL..."
-        pacman -Sy &>/dev/null
-        local missing=()
-        for pkg in $DE_PKGS; do
-            pacman -Si "$pkg" &>/dev/null || missing+=("$pkg")
-        done
-        if [[ ${#missing[@]} -gt 0 ]]; then
-            err "These packages were not found on your mirrors: ${missing[*]}"
-            warn "Package names can drift over time — check https://archlinux.org/packages/"
-            warn "for the current name and edit DE_PKGS in this script, or continue"
-            warn "and the base system will still install without this desktop."
-            if confirm "Continue with base install only (no desktop)?"; then
-                DE_PKGS=""; DE_MODE="none"; DE_SERVICE=""; DE_LABEL="Minimal CLI Only (packages unavailable)"
-            else
-                die "Aborting so you can fix the package list."
-            fi
+detect_boot_disks() {
+    BOOT_DISKS=()
+    local mp="" source="" known=0 word="" value="" cmdline=""
+    for mp in /run/archiso/bootmnt /run/archiso/img_dev; do
+        source=$(findmnt -rn -e -o SOURCE -M "$mp" 2>/dev/null) || continue
+        [[ -n "$source" ]] || continue
+        if protect_boot_source "$source"; then
+            known=1
+        else
+            # An actual live-medium mount that cannot be resolved is unsafe.
+            return 1
         fi
+    done
+    (( known == 1 )) && return 0
+
+    # Fallback for copy-to-RAM or live layouts without the usual mount.
+    # build.sh uses archisosearchuuid; older profiles use a label/device.
+    IFS= read -r cmdline < /proc/cmdline || return 1
+    local -a words=()
+    read -r -a words <<< "$cmdline"
+    for word in "${words[@]}"; do
+        source=""
+        case "$word" in
+            archisosearchuuid=*)
+                value="${word#*=}"
+                source=$(findfs "UUID=$value" 2>/dev/null) || continue
+                ;;
+            archisolabel=*)
+                value="${word#*=}"
+                source=$(findfs "LABEL=$value" 2>/dev/null) || continue
+                ;;
+            archisodevice=*|img_dev=*)
+                value="${word#*=}"
+                case "$value" in
+                    /dev/*) source="$value" ;;
+                    UUID=*|PARTUUID=*|LABEL=*|PARTLABEL=*)
+                        source=$(findfs "$value" 2>/dev/null) || continue ;;
+                    *) continue ;;
+                esac
+                ;;
+            *) continue ;;
+        esac
+        if protect_boot_source "$source"; then known=1; else return 1; fi
+    done
+    (( known == 1 ))
+}
+
+DISK_REASON=""
+disk_is_safe() {
+    local disk="$1" boot="" kind="" stats="" ro="" bytes="" mounts="" types=""
+    DISK_REASON=""
+    is_block_device "$disk" || { DISK_REASON="not a block device"; return 1; }
+    kind=$(lsblk -dn -o TYPE -- "$disk" 2>/dev/null) || { DISK_REASON="cannot inspect device"; return 1; }
+    [[ "$kind" == disk ]] || { DISK_REASON="not a whole physical disk"; return 1; }
+    for boot in "${BOOT_DISKS[@]}"; do
+        [[ "$disk" != "$boot" ]] || { DISK_REASON="installer boot drive"; return 1; }
+    done
+    stats=$(lsblk -dnb -o RO,SIZE -- "$disk" 2>/dev/null) || { DISK_REASON="cannot inspect capacity"; return 1; }
+    read -r ro bytes <<< "$stats"
+    [[ "$ro" == 0 ]] || { DISK_REASON="read-only drive"; return 1; }
+    [[ "$bytes" =~ ^[0-9]+$ ]] || { DISK_REASON="unknown drive capacity"; return 1; }
+    (( bytes >= 8589934592 )) || { DISK_REASON="smaller than 8 GiB"; return 1; }
+    mounts=$(lsblk -nr -o MOUNTPOINTS -- "$disk" 2>/dev/null) || { DISK_REASON="cannot inspect mounts"; return 1; }
+    [[ ! "$mounts" =~ [^[:space:]] ]] || { DISK_REASON="mounted filesystem or active swap"; return 1; }
+    types=$(lsblk -nr -o TYPE -- "$disk" 2>/dev/null) || { DISK_REASON="cannot inspect child devices"; return 1; }
+    while read -r kind; do
+        case "$kind" in
+            disk|part) ;;
+            *) DISK_REASON="active mapped/RAID device; disconnect it safely first"; return 1 ;;
+        esac
+    done <<< "$types"
+    return 0
+}
+
+disk_identity() {
+    lsblk -dnb -o MAJ:MIN,SIZE,MODEL,SERIAL,WWN -- "$1"
+}
+
+step_disk() {
+    CURRENT_STAGE="target-drive selection"
+    banner "STEP 6: Target Installation Drive"
+    detect_boot_disks || die "Cannot identify the installer boot drive safely. No erase targets will be offered. Use a directly flashed USB (Rufus DD mode), then restart."
+    OFFERED_DISKS=()
+    local rows="" disk="" kind="" description="" identity="" choice="" found=0
+    local -a menu_items=()
+    local -A identities=() descriptions=()
+    rows=$(lsblk -dnpr -e 7,11 -o NAME,TYPE) || die "Could not list storage drives."
+    while read -r disk kind; do
+        [[ "$kind" == disk ]] || continue
+        if ! disk_is_safe "$disk"; then
+            info "Not offered: $disk ($DISK_REASON)"
+            continue
+        fi
+        description=$(lsblk -dn -o SIZE,MODEL,SERIAL -- "$disk") || die "Could not inspect $disk."
+        identity=$(disk_identity "$disk") || die "Could not identify $disk."
+        [[ -n "$identity" ]] || die "Empty device identity for $disk."
+        OFFERED_DISKS+=("$disk")
+        menu_items+=("$disk" "$description")
+        identities["$disk"]="$identity"
+        descriptions["$disk"]="$description"
+    done <<< "$rows"
+    (( ${#OFFERED_DISKS[@]} > 0 )) || die "No safe target drives found. Only unmounted, writable disks of at least 8 GiB are offered; the installer drive is excluded."
+    choice=$(menu_pick "Select Target Drive" \
+        "Choose carefully: ALL DATA on the selected drive will be erased.\nThe installer drive and disks in use are excluded." \
+        20 76 10 "${menu_items[@]}") || selection_failed "$?" "target-drive selection"
+    # Defense in depth: exact membership of the offered set, not all disks.
+    for disk in "${OFFERED_DISKS[@]}"; do
+        if [[ "$choice" == "$disk" ]]; then found=1; break; fi
+    done
+    (( found == 1 )) || die "The returned drive was not an offered target."
+    TARGET_DISK="$choice"
+    TARGET_ID="${identities[$choice]}"
+    TARGET_DESCRIPTION="${descriptions[$choice]}"
+    ok "Selected $TARGET_DISK: $TARGET_DESCRIPTION"
+}
+
+verify_target_before_erase() {
+    (( PACKAGES_CHECKED == 1 )) || die "Package checks have not completed."
+    [[ -n "$TARGET_DISK" && -n "$TARGET_ID" ]] || die "No validated target drive."
+    local found=0 disk="" identity="" mounts=""
+    for disk in "${OFFERED_DISKS[@]}"; do
+        [[ "$disk" == "$TARGET_DISK" ]] && found=1
+    done
+    (( found == 1 )) || die "The target was not in the offered drive list."
+    detect_boot_disks || die "The installer boot drive can no longer be identified safely."
+    disk_is_safe "$TARGET_DISK" || die "Target is no longer safe: $DISK_REASON"
+    identity=$(disk_identity "$TARGET_DISK") || die "Cannot recheck target identity."
+    [[ "$identity" == "$TARGET_ID" ]] || die "The drive identity changed after selection. Restart without plugging/unplugging drives."
+    mounts=$(findmnt -rn -o TARGET) || die "Cannot recheck mount state."
+    if printf '%s\n' "$mounts" | grep -Eq '^/mnt(/|$)'; then
+        die "/mnt is already mounted. Refusing to overwrite another installation."
     fi
+    [[ ! -L /mnt ]] || die "/mnt must not be a symbolic link."
+}
 
-    banner "Installing base system (pacstrap — downloads over your network)"
-    # shellcheck disable=SC2086
-    pacstrap -K /mnt base linux linux-firmware sudo networkmanager iwd \
-        grub efibootmgr os-prober vim nano dialog fastfetch \
-        mesa vulkan-icd-loader \
-        $DE_PKGS \
-        || die "pacstrap failed. Check network connectivity and retry."
 
-    genfstab -U /mnt >> /mnt/etc/fstab
+# ---------------------------------------------------------------------
+# Installation. Every destructive prerequisite is checked explicitly.
+# ---------------------------------------------------------------------
+set_target_password() {
+    # Only DATA crosses stdin; the password is never shell source, a command
+    # argument, a logged command, or a plaintext file on the target.
+    info "Setting the account password"
+    if printf '%s:%s\n' "$XYLO_USER" "$XYLO_PASS" | \
+        arch-chroot /mnt chpasswd 2>&1 | tee -a "$LOG_FILE"; then
+        XYLO_PASS=""
+    else
+        XYLO_PASS=""
+        die "Could not set the account password."
+    fi
+}
 
-    echo "xyloos" > /mnt/etc/hostname
-    cat > /mnt/etc/hosts <<EOF
-127.0.0.1   localhost
-127.0.1.1   xyloos
-::1         localhost ip6-localhost ip6-loopback
-EOF
+step_install() {
+    CURRENT_STAGE="final disk-safety checks"
+    verify_target_before_erase
+    CURRENT_STAGE="partitioning"
+    banner "Partitioning $TARGET_DISK"
+    # Conservative marker: wipefs may make partial changes even on failure.
+    DISK_CHANGED=1
+    run_logged "Removing old filesystem signatures" wipefs -af "$TARGET_DISK"
+    run_logged "Creating a GPT partition table" parted -s "$TARGET_DISK" mklabel gpt
+    # The unformatted BIOS Boot partition is required by BIOS GRUB on GPT.
+    # Keeping an ESP too lets the same layout support either boot mode.
+    run_logged "Creating the BIOS Boot partition" parted -s "$TARGET_DISK" mkpart BIOSBOOT 1MiB 2MiB
+    run_logged "Setting the BIOS Boot flag" parted -s "$TARGET_DISK" set 1 bios_grub on
+    run_logged "Creating the EFI System Partition" parted -s "$TARGET_DISK" mkpart ESP fat32 2MiB 514MiB
+    run_logged "Setting the EFI flag" parted -s "$TARGET_DISK" set 2 esp on
+    run_logged "Creating the root partition" parted -s "$TARGET_DISK" mkpart xylo-root ext4 514MiB 100%
+    run_logged "Refreshing the kernel partition table" partprobe "$TARGET_DISK"
+    run_logged "Waiting for storage devices" udevadm settle --timeout=30
 
-    # Carry the ASCII logo + fastfetch config from the live medium onto
-    # the target, and rebrand the installed system itself (not just the
-    # live ISO) so it actually identifies as xyloOS once installed.
+    local prefix="$TARGET_DISK" i=0 parent=""
+    [[ "$prefix" == *[0-9] ]] && prefix+="p"
+    ESP_PART="${prefix}2"
+    ROOT_PART="${prefix}3"
+    for ((i=0; i<10; i++)); do
+        if is_block_device "$ESP_PART" && is_block_device "$ROOT_PART"; then break; fi
+        sleep 1
+    done
+    is_block_device "$ESP_PART" && is_block_device "$ROOT_PART" \
+        || die "The new partition devices did not appear. Formatting was not started."
+    for parent in "$ESP_PART" "$ROOT_PART"; do
+        [[ "$(lsblk -dn -o PKNAME -- "$parent")" == "${TARGET_DISK##*/}" ]] \
+            || die "Partition $parent does not belong to the selected disk."
+    done
+    CURRENT_STAGE="formatting and mounting"
+    run_logged "Formatting the EFI System Partition" mkfs.fat -F32 -n XYLOEFI "$ESP_PART"
+    run_logged "Formatting the root partition" mkfs.ext4 -F -L xylo-root "$ROOT_PART"
+    install -d -m 755 /mnt || die "Cannot prepare /mnt."
+    run_logged "Mounting the new root filesystem" mount "$ROOT_PART" /mnt
+    MOUNTED_ROOT=1
+    install -d -m 755 /mnt/boot/efi || die "Cannot create the EFI mount directory."
+    run_logged "Mounting the EFI System Partition" mount "$ESP_PART" /mnt/boot/efi
+    mountpoint -q /mnt && mountpoint -q /mnt/boot/efi || die "Required filesystems are not mounted."
+
+    CURRENT_STAGE="installing packages"
+    banner "Installing $DE_LABEL (downloads over your network)"
+    run_logged "Installing the base system and selected desktop" pacstrap -K /mnt "${INSTALL_TARGETS[@]}"
+    CURRENT_STAGE="filesystem configuration"
+    genfstab -U /mnt > "$RUN_DIR/fstab" || die "Could not generate the filesystem table."
+    grep -Eq '^[^#]+[[:space:]]/[[:space:]]+ext4[[:space:]]' "$RUN_DIR/fstab" \
+        || die "The root filesystem is missing from the generated fstab."
+    grep -Eq '^[^#]+[[:space:]]/boot/efi[[:space:]]+vfat[[:space:]]' "$RUN_DIR/fstab" \
+        || die "The EFI filesystem is missing from the generated fstab."
+    install -m 644 "$RUN_DIR/fstab" /mnt/etc/fstab || die "Could not save fstab."
+    printf '%s\n' xyloos > /mnt/etc/hostname || die "Could not set the hostname."
+    printf '%s\n' '127.0.0.1 localhost' '127.0.1.1 xyloos' '::1 localhost ip6-localhost ip6-loopback' \
+        > /mnt/etc/hosts || die "Could not write hosts."
+
+    # Carry existing project branding across without requiring build.sh edits.
     if [[ -d /etc/xyloos ]]; then
-        mkdir -p /mnt/etc/xyloos /mnt/etc/skel/.config/fastfetch /mnt/root/.config/fastfetch
-        cp -r /etc/xyloos/. /mnt/etc/xyloos/ 2>/dev/null || true
-        [[ -f /etc/xdg/fastfetch/config.jsonc ]] && { mkdir -p /mnt/etc/xdg/fastfetch; cp /etc/xdg/fastfetch/config.jsonc /mnt/etc/xdg/fastfetch/; }
-        [[ -f /etc/skel/.config/fastfetch/config.jsonc ]] && cp /etc/skel/.config/fastfetch/config.jsonc /mnt/etc/skel/.config/fastfetch/
-        [[ -f /root/.config/fastfetch/config.jsonc ]] && cp /root/.config/fastfetch/config.jsonc /mnt/root/.config/fastfetch/
+        install -d -m 755 /mnt/etc/xyloos || die "Could not prepare branding directory."
+        cp -a /etc/xyloos/. /mnt/etc/xyloos/ || die "Could not copy xyloOS branding."
+    fi
+    local config="" dest=""
+    for config in /etc/xdg/fastfetch/config.jsonc /etc/skel/.config/fastfetch/config.jsonc /root/.config/fastfetch/config.jsonc; do
+        [[ -f "$config" ]] || continue
+        dest="/mnt$config"
+        install -D -m 644 "$config" "$dest" || die "Could not copy fastfetch configuration."
+    done
+    if [[ "$BUILD_DWM_FROM_SOURCE" == 1 ]]; then
+        install -d -m 755 /mnt/usr/local/src || die "Could not prepare dwm source directory."
+        cp -a "$RUN_DIR/dwm" /mnt/usr/local/src/xylo-dwm || die "Could not copy the pre-fetched dwm source."
     fi
 
-    banner "Configuring the installed system"
-    # arch-chroot (from arch-install-scripts) bind-mounts /dev, /proc,
-    # /sys (including efivars), /run, and copies resolv.conf automatically
-    # — this sidesteps the manual-bind-mount efivars pitfall entirely.
-    arch-chroot /mnt /bin/bash <<CHROOT
-set -e
-ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
-hwclock --systohc
+    CURRENT_STAGE="account creation"
+    run_logged "Creating the user account" arch-chroot /mnt useradd -m -U -G wheel -s /bin/bash "$XYLO_USER"
+    set_target_password
 
-echo "${LOCALE} UTF-8" >> /etc/locale.gen
+    CURRENT_STAGE="system and bootloader configuration"
+    run_logged "Configuring the installed system" arch-chroot /mnt /bin/bash -s -- \
+        "$TIMEZONE" "$LOCALE" "$XYLO_USER" "$DE_MODE" "$DE_SERVICE" \
+        "$WM_EXEC" "$BOOT_MODE" "$TARGET_DISK" "$BUILD_DWM_FROM_SOURCE" <<'CHROOT'
+set -Eeuo pipefail
+trap 'rc=$?; printf "Configuration stopped at line %s (exit %s).\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+export LC_ALL=C
+TIMEZONE="$1"; LOCALE="$2"; XYLO_USER="$3"; DE_MODE="$4"; DE_SERVICE="$5"
+WM_EXEC="$6"; BOOT_MODE="$7"; TARGET_DISK="$8"; BUILD_DWM_FROM_SOURCE="$9"
+[[ -f "/usr/share/zoneinfo/$TIMEZONE" ]]
+ln -sfn "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+if ! hwclock --systohc; then
+    printf '%s\n' 'Warning: hardware clock could not be updated; network time will be used.' >&2
+fi
+if ! grep -Fqx "$LOCALE UTF-8" /etc/locale.gen; then
+    printf '%s UTF-8\n' "$LOCALE" >> /etc/locale.gen
+fi
 locale-gen
-echo "LANG=${LOCALE}" > /etc/locale.conf
+printf 'LANG=%s\n' "$LOCALE" > /etc/locale.conf
 
-cat > /etc/os-release <<'OSEOF'
+cat > /etc/xyloos-release <<'OSEOF'
 NAME="xyloOS"
 PRETTY_NAME="xyloOS"
 ID=xyloos
@@ -836,99 +857,153 @@ ID_LIKE=arch
 VERSION="1.0"
 ANSI_COLOR="1;36"
 OSEOF
-echo "xyloOS \\n \\l" > /etc/issue
-
-useradd -m -G wheel -s /bin/bash "${XYLO_USER}"
-echo "${XYLO_USER}:${XYLO_PASS}" | chpasswd
+ln -sfn xyloos-release /etc/os-release
+printf '%s\n' 'xyloOS \n \l' > /etc/issue
+printf '%s\n' xyloOS > /etc/issue.net
 passwd -l root
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+install -d -m 755 /etc/sudoers.d
+printf '%s\n' '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-xyloos-wheel
+chmod 440 /etc/sudoers.d/10-xyloos-wheel
+visudo -cf /etc/sudoers
 
-if [[ "${BUILD_DWM_FROM_SOURCE}" == "1" ]]; then
-    mkdir -p /usr/local/src
-    cd /usr/local/src
-    git clone https://git.suckless.org/dwm
-    cd dwm
-    make clean install
-    cd /
-fi
-
-# No Plymouth splash on the installed system either — same Arch-branding
-# risk applies here as on the live ISO (see build.sh's CHANGELOG). Arch's
-# default GRUB config boots "quiet" out of the box; without a splash to
-# show in its place that means a genuinely blank screen with zero
-# feedback, so this explicitly drops "quiet" here to keep boot text
-# visible instead.
-if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
-    sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3"/' /etc/default/grub
-else
-    echo 'GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3"' >> /etc/default/grub
-fi
-
-mkinitcpio -P
-
+# Explicitly select NetworkManager's default Wi-Fi backend; its package was
+# included in the preflight. The user can reconnect after the first boot.
+install -d -m 755 /etc/NetworkManager/conf.d
+printf '%s\n' '[device]' 'wifi.backend=wpa_supplicant' > /etc/NetworkManager/conf.d/10-xyloos-wifi.conf
 systemctl enable NetworkManager
-if [[ "${DE_MODE}" == "dm" && -n "${DE_SERVICE}" ]]; then
-    systemctl enable "${DE_SERVICE}" || true
-elif [[ "${DE_MODE}" == "wm-x11" || "${DE_MODE}" == "wm-wayland" ]]; then
-    mkdir -p /etc/systemd/system/getty@tty1.service.d
-    cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'AUTOEOF'
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin ${XYLO_USER} --noclear %I \$TERM
-AUTOEOF
+systemctl enable systemd-timesyncd
 
-    if [[ "${DE_MODE}" == "wm-x11" ]]; then
-        cat > /home/${XYLO_USER}/.bash_profile <<'PROFEOF'
-if [[ -z "\${DISPLAY}" && "\$(tty)" == "/dev/tty1" ]]; then
+# Keep boot text visible. No Plymouth changes are part of this repair.
+sed -i '/^GRUB_DISTRIBUTOR=/d; /^GRUB_CMDLINE_LINUX_DEFAULT=/d; /^GRUB_DISABLE_OS_PROBER=/d' /etc/default/grub
+printf '%s\n' 'GRUB_DISTRIBUTOR="xyloOS"' 'GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3"' \
+    'GRUB_DISABLE_OS_PROBER=true' >> /etc/default/grub
+mkinitcpio -P
+if [[ "$BOOT_MODE" == uefi ]]; then
+    # Install boot files independently of firmware-variable write access.
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=xyloOS --no-nvram
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram
+    if ! efibootmgr --create --disk "$TARGET_DISK" --part 2 --label xyloOS --loader '\EFI\xyloOS\grubx64.efi'; then
+        printf '%s\n' 'Warning: firmware boot entry could not be registered. The EFI fallback boot file was installed; select this disk in firmware if necessary.' >&2
+    fi
+    [[ -s /boot/efi/EFI/xyloOS/grubx64.efi && -s /boot/efi/EFI/BOOT/BOOTX64.EFI ]]
+else
+    grub-install --target=i386-pc "$TARGET_DISK"
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
+[[ -s /boot/grub/grub.cfg && -s /boot/vmlinuz-linux && -s /boot/initramfs-linux.img ]]
+
+# Only the optional dwm compile remains after the base is made bootable.
+if [[ "$BUILD_DWM_FROM_SOURCE" == 1 ]]; then
+    make -C /usr/local/src/xylo-dwm clean all
+    make -C /usr/local/src/xylo-dwm install
+fi
+
+if [[ "$DE_MODE" == dm ]]; then
+    if [[ "$DE_SERVICE" == lightdm ]]; then
+        install -d -m 755 /etc/lightdm/lightdm.conf.d
+        printf '%s\n' '[Seat:*]' 'greeter-session=lightdm-gtk-greeter' > /etc/lightdm/lightdm.conf.d/10-xyloos.conf
+    fi
+    # A missing/broken desktop service must not be reported as success.
+    systemctl enable "$DE_SERVICE"
+    systemctl set-default graphical.target
+else
+    systemctl set-default multi-user.target
+fi
+
+if [[ "$DE_MODE" == wm-x11 || "$DE_MODE" == wm-wayland ]]; then
+    # Require a normal password login; start the selected WM on tty1 after
+    # login. Do not silently enable password-free installed-system login.
+    cat > "/home/$XYLO_USER/.bash_profile" <<'PROFEOF'
+[[ -f ~/.bashrc ]] && . ~/.bashrc
+PROFEOF
+    if [[ "$DE_MODE" == wm-x11 ]]; then
+        cat >> "/home/$XYLO_USER/.bash_profile" <<'PROFEOF'
+if [[ -z "${DISPLAY:-}" && "$(tty)" == /dev/tty1 ]]; then
     exec startx
 fi
 PROFEOF
-        cat > /home/${XYLO_USER}/.xinitrc <<'XINITEOF'
-${WM_EXEC}
+        cat > "/home/$XYLO_USER/.xinitrc" <<'XINITEOF'
+#!/bin/sh
+if [ -d /etc/X11/xinit/xinitrc.d ]; then
+    for script in /etc/X11/xinit/xinitrc.d/?*.sh; do
+        [ -r "$script" ] && . "$script"
+    done
+    unset script
+fi
 XINITEOF
+        printf '%s\n' "$WM_EXEC" >> "/home/$XYLO_USER/.xinitrc"
+        chmod 755 "/home/$XYLO_USER/.xinitrc"
+        chown "$XYLO_USER:$XYLO_USER" "/home/$XYLO_USER/.xinitrc"
+        if command -v bspwm >/dev/null 2>&1; then
+            install -d -m 755 "/home/$XYLO_USER/.config/bspwm" "/home/$XYLO_USER/.config/sxhkd"
+            printf '%s\n' '#!/bin/sh' 'bspc monitor -d 1 2 3 4 5' > "/home/$XYLO_USER/.config/bspwm/bspwmrc"
+            chmod 755 "/home/$XYLO_USER/.config/bspwm/bspwmrc"
+            cat > "/home/$XYLO_USER/.config/sxhkd/sxhkdrc" <<'SXHKDEOF'
+super + Return
+    xterm
+super + d
+    rofi -show drun
+super + q
+    bspc node -c
+SXHKDEOF
+            chown -R "$XYLO_USER:$XYLO_USER" "/home/$XYLO_USER/.config"
+        fi
     else
-        cat > /home/${XYLO_USER}/.bash_profile <<'PROFEOF'
-if [[ -z "\${WAYLAND_DISPLAY}" && -z "\${DISPLAY}" && "\$(tty)" == "/dev/tty1" ]]; then
-    exec ${WM_EXEC}
-fi
-PROFEOF
+        printf '%s\n' 'if [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" && "$(tty)" == /dev/tty1 ]]; then' \
+            "    exec dbus-run-session -- $WM_EXEC" 'fi' >> "/home/$XYLO_USER/.bash_profile"
     fi
-    chown "${XYLO_USER}:${XYLO_USER}" "/home/${XYLO_USER}/.bash_profile"
-    [[ -f "/home/${XYLO_USER}/.xinitrc" ]] && chown "${XYLO_USER}:${XYLO_USER}" "/home/${XYLO_USER}/.xinitrc"
+    chown "$XYLO_USER:$XYLO_USER" "/home/$XYLO_USER/.bash_profile"
 fi
 
-if command -v fastfetch &>/dev/null; then
-    cat >> /etc/bash.bashrc <<'FFEOF'
+cat >> /etc/bash.bashrc <<'FFEOF'
 
-# xyloOS: show system info banner on interactive shell login
-if [[ \$- == *i* ]] && [[ -z "\$XYLOOS_FASTFETCH_SHOWN" ]] && command -v fastfetch &>/dev/null; then
+# xyloOS: show the existing branded system-information banner once.
+if [[ $- == *i* && -z "${XYLOOS_FASTFETCH_SHOWN:-}" ]] && command -v fastfetch >/dev/null 2>&1; then
     export XYLOOS_FASTFETCH_SHOWN=1
     fastfetch
 fi
 FFEOF
-fi
-
-if [[ -d /sys/firmware/efi ]]; then
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=xyloOS
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable
-else
-    grub-install --target=i386-pc "${TARGET_DISK}"
-fi
-grub-mkconfig -o /boot/grub/grub.cfg
 CHROOT
-    local rc=$?
-    [[ $rc -eq 0 ]] || die "System configuration inside chroot failed."
-
-    umount -R /mnt
-    ok "xyloOS installation complete."
+    CURRENT_STAGE="finishing"
+    copy_install_log
+    run_logged "Flushing filesystem writes" sync
+    run_logged "Unmounting the installed system" umount -R /mnt
+    MOUNTED_ROOT=0
+    ok "xyloOS installation complete. Remove the installer USB when rebooting."
 }
 
+
 # ---------------------------------------------------------------------
-# Main flow
+# Main flow. --version is safe and performs no installation work.
 # ---------------------------------------------------------------------
 main() {
+    case "${1:-}" in
+        --version) printf 'xylo-installer %s\n' "$INSTALLER_VERSION"; return 0 ;;
+        --help|-h)
+            printf '%s\n' "xyloOS installer $INSTALLER_VERSION" \
+                'Boot the xyloOS live USB, then run xylo-installer as root.' \
+                'This interactive installer erases the entire selected target disk.'
+            return 0
+            ;;
+        "") ;;
+        *) die "Unknown option. Use --help or run without arguments." ;;
+    esac
     require_root
-    clear
+    (( HAVE_DIALOG == 1 )) || die "dialog is missing from the live ISO."
+    [[ -t 0 && -t 2 ]] || die "Run the wizard in an interactive terminal, not through a pipe."
+    [[ -d /run/archiso ]] || die "Boot the xyloOS live USB first. Do not run this installer inside an installed operating system."
+    command -v flock >/dev/null 2>&1 || die "The live ISO is missing flock."
+    exec 9>/run/lock/xylo-installer.lock || die "Could not open the installer lock."
+    flock -n 9 || die "Another xyloOS installer is already running."
+    umask 022
+    RUN_DIR=$(mktemp -d /tmp/xylo-installer.XXXXXX) || die "Cannot create temporary workspace."
+    trap cleanup EXIT
+    trap 'warn "Interrupted."; exit 130' INT
+    trap 'warn "Terminated."; exit 143' TERM
+    LOG_FILE=$(mktemp /tmp/xylo-install.XXXXXX.log) || die "Cannot create the installation log."
+    printf 'xylo-installer %s\nSource base: 889bb2bdcba93946fcc9670390708fb0f8dc32d9\nStarted: %s\n' \
+        "$INSTALLER_VERSION" "$(date -u +%FT%TZ)" > "$LOG_FILE"
+    clear_screen
     cat <<'BANNER'
                              @@@@@@@@@@@@                             
                           @@@@@@@@@@@@@@@@@@@@@@                        
@@ -960,38 +1035,43 @@ main() {
 
                      xyloOS Installation Wizard
 BANNER
+    info "Installer version: $INSTALLER_VERSION"
+    info "Log: $LOG_FILE"
     sleep 1
-
+    CURRENT_STAGE="language selection"
     step_lang
-
+    CURRENT_STAGE="network setup"
     while ! step_wifi; do
-        echo
-        warn "Wi-Fi setup did not complete."
-        if confirm "Try Wi-Fi setup again?"; then
+        warn "Network setup did not complete."
+        if confirm "Try network setup again?"; then
             continue
         else
-            warn "Continuing without confirmed internet access."
-            warn "The install step later on needs internet to fetch packages,"
-            warn "so make sure you have a wired connection before proceeding."
+            warn "Continuing the wizard. A working network must pass the package checks before any disk is erased."
             break
         fi
     done
+    CURRENT_STAGE="timezone selection"
     step_timezone
+    CURRENT_STAGE="user account entry"
     step_user
+    CURRENT_STAGE="desktop selection"
     step_de
+    step_preflight
     step_disk
 
     banner "Ready to Install"
-    if ! confirm "Language      : $LANG_LABEL\nTimezone      : $TIMEZONE\nUsername      : $XYLO_USER\nDesktop       : $DE_LABEL\nTarget drive  : $TARGET_DISK\n\nTHIS ERASES $TARGET_DISK.\n\nProceed with installation?"; then
-        die "Installation cancelled by user."
+    if ! confirm "Language: $LANG_LABEL\nTimezone: $TIMEZONE\nUsername: $XYLO_USER\nDesktop: $DE_LABEL\nBoot mode: $BOOT_MODE\n\nERASE: $TARGET_DISK\n$TARGET_DESCRIPTION\n\nALL DATA on this entire drive will be lost.\nBack up anything important first.\n\nErase this drive and install xyloOS?"; then
+        die "Installation cancelled before erasing the target."
     fi
-
     step_install
-
     echo
-    if confirm "Installation finished. Reboot now?"; then
-        reboot
+    if confirm "Installation finished. Remove the installer USB when the machine restarts.\n\nReboot now?"; then
+        reboot || die "Could not request a reboot. Reboot manually."
     fi
 }
 
-main "$@"
+# Sourceable for non-destructive function tests; no root/install side effects
+# occur merely from sourcing this file.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
