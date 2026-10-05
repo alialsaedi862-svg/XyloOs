@@ -224,6 +224,55 @@ cat > "${AIROOTFS}/etc/profile.d/xyloos-aliases.sh" <<'EOF'
 alias xyloinstall='sudo xylo-installer'
 EOF
 
+# ---- 5b. fastfetch: xyloOS logo ---------------------------------------------
+# fastfetch falls back to the Arch logo whenever os-release says ID_LIKE=arch, so
+# the xyloOS logo and a system-wide fastfetch config are installed here. The
+# installer already copies /etc/xyloos and /etc/xdg/fastfetch/config.jsonc into
+# the installed system, so the live ISO and the installed OS show the same logo.
+# (Nothing in the Arch fastfetch package ships under /etc, so no file conflicts.)
+c_green "==> Installing the xyloOS fastfetch logo..."
+mkdir -p "${AIROOTFS}/etc/xyloos" "${AIROOTFS}/etc/xdg/fastfetch"
+cat > "${AIROOTFS}/etc/xyloos/logo.txt" <<'LOGOEOF'
+$1        ..@@@@@@@@.....
+$1      .@@@@@@@@@@@@@@@@@.
+$1    @@@@@@@@@@.....@@@@@@@.
+$1  .@@@@@@@@...@@@@@@@@.@@@@@
+$1 .@@@.@@@..@@@@@@@@@@@@@@@@@@
+$1.@@@.@@@@.@@@@@@@@@@@@@@@@@@@@
+$1@@@@.@@@@@@@@@.........@@@@@@@.
+$1@@@..@@@@@@@.............@@@@@@
+$1@@@...@@@@@......     ....@@@@.
+$1@@@@..@@@@@...          ..@@@@.
+$1.@@@....@@@...          ..@@@..
+$1..@@@.....@@.           ..@@@..
+$1 ..@@@.......           @@@@..
+$1  ..@@@@.....          @@@@..
+$1   ..@@@@@@..     ...@@@@...
+$1    ....@@@..@@@@@@@@@.....
+$1      ......@@@@@@@......
+$1          ...........
+LOGOEOF
+cat > "${AIROOTFS}/etc/xdg/fastfetch/config.jsonc" <<'FFCONFEOF'
+{
+  "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+  "logo": {
+    "type": "file",
+    "source": "/etc/xyloos/logo.txt",
+    "color": { "1": "cyan" },
+    "padding": { "right": 3 }
+  },
+  "modules": [
+    "title", "separator", "os", "host", "kernel", "uptime", "packages", "shell",
+    "display", "de", "wm", "wmtheme", "theme", "icons", "font", "cursor",
+    "terminal", "terminalfont", "cpu", "gpu", "memory", "swap",
+    { "type": "disk", "folders": "/" },
+    "localip", "battery", "poweradapter", "locale", "break", "colors"
+  ]
+}
+FFCONFEOF
+[[ -s "${AIROOTFS}/etc/xyloos/logo.txt" && -s "${AIROOTFS}/etc/xdg/fastfetch/config.jsonc" ]] \
+  || die "Could not write the fastfetch logo files."
+
 # ---- 6. Black dialog theme (replaces the default blue screen) --------------
 c_green "==> Installing black dialog theme..."
 mkdir -p "${AIROOTFS}/etc/xyloos"
