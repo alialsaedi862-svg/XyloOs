@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # xyloOS installation wizard -- drop-in repair of the existing installer.
 # Base revision: 889bb2bdcba93946fcc9670390708fb0f8dc32d9
+# r2: the installer-drive check now runs FIRST (before the wizard) and prints a
+# read-only evidence report if the live medium cannot be identified. Disk
+# selection, partitioning and pacstrap logic are unchanged from r1.
 # This program erases ONE explicitly selected whole disk. Back up that disk.
 # Screen output and returned dialog values must always use separate streams.
 # No disk is modified until package checks and the final confirmation pass.
@@ -10,7 +13,7 @@ export LC_ALL=C
 export TERM="${TERM:-linux}"
 [[ "$TERM" == dumb ]] && export TERM=linux
 
-INSTALLER_VERSION="2026.09.12-r1"
+INSTALLER_VERSION="2026.10.03-r2"
 BOLD=$'\033[1m'; RESET=$'\033[0m'
 CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; YELLOW=$'\033[1;33m'
 banner() { printf '\n%s=== %s ===%s\n' "$BOLD$CYAN" "$*" "$RESET" >&2; }
@@ -647,6 +650,38 @@ detect_boot_disks() {
     (( known == 1 ))
 }
 
+# Read-only evidence for the boot-drive decision, shown on screen and logged,
+# so a failure can be diagnosed from one photo instead of by guessing.
+boot_probe_report() {
+    local mp="" src="" cmdline="" word="" report=""
+    local -a words=()
+    report="Boot-drive probe (read-only; nothing has been changed):"$'\n'
+    for mp in /run/archiso/bootmnt /run/archiso/img_dev; do
+        src=$(findmnt -rn -e -o SOURCE -M "$mp" 2>/dev/null) || src=""
+        report+=$(printf '  %-26s %s' "$mp" "${src:-<not mounted>}")$'\n'
+    done
+    if IFS= read -r cmdline < /proc/cmdline; then
+        read -r -a words <<< "$cmdline"
+        for word in "${words[@]}"; do
+            case "$word" in
+                archiso*|img_dev=*|copytoram*) report+="  cmdline: $word"$'\n' ;;
+            esac
+        done
+    fi
+    report+=$(lsblk -o NAME,TYPE,SIZE,FSTYPE,LABEL,MOUNTPOINTS 2>&1)$'\n'
+    printf '%s' "$report" >&2
+    [[ -n "$LOG_FILE" ]] && printf '%s' "$report" >> "$LOG_FILE" 2>/dev/null
+    return 0
+}
+
+# One place for "do we know which drive is the installer?" -- asked up front by
+# main() and again at disk selection. Fails closed, but with evidence.
+require_boot_drive() {
+    detect_boot_disks && return 0
+    boot_probe_report
+    die "Cannot identify the installer boot drive safely, so no erase targets can be offered. Use a directly flashed USB (Rufus DD mode), then restart. If it still stops here, photograph the probe report above."
+}
+
 DISK_REASON=""
 disk_is_safe() {
     local disk="$1" boot="" kind="" stats="" ro="" bytes="" mounts="" types=""
@@ -681,7 +716,7 @@ disk_identity() {
 step_disk() {
     CURRENT_STAGE="target-drive selection"
     banner "STEP 6: Target Installation Drive"
-    detect_boot_disks || die "Cannot identify the installer boot drive safely. No erase targets will be offered. Use a directly flashed USB (Rufus DD mode), then restart."
+    require_boot_drive
     OFFERED_DISKS=()
     local rows="" disk="" kind="" description="" identity="" choice="" found=0
     local -a menu_items=()
@@ -1003,6 +1038,8 @@ main() {
     LOG_FILE=$(mktemp /tmp/xylo-install.XXXXXX.log) || die "Cannot create the installation log."
     printf 'xylo-installer %s\nSource base: 889bb2bdcba93946fcc9670390708fb0f8dc32d9\nStarted: %s\n' \
         "$INSTALLER_VERSION" "$(date -u +%FT%TZ)" > "$LOG_FILE"
+    CURRENT_STAGE="installer drive check"
+    require_boot_drive
     clear_screen
     cat <<'BANNER'
                              @@@@@@@@@@@@                             
