@@ -262,7 +262,9 @@ cat > "${AIROOTFS}/etc/xdg/fastfetch/config.jsonc" <<'FFCONFEOF'
     "padding": { "right": 3 }
   },
   "modules": [
-    "title", "separator", "os", "host", "kernel", "uptime", "packages", "shell",
+    "title", "separator", "os", "host",
+    { "type": "command", "key": "Kernel", "text": "/usr/bin/uname -sr | sed -E 's/-arch([0-9]+)-([0-9]+)/-xylo\\1-\\2/'" },
+    "uptime", "packages", "shell",
     "display", "de", "wm", "wmtheme", "theme", "icons", "font", "cursor",
     "terminal", "terminalfont", "cpu", "gpu", "memory", "swap",
     { "type": "disk", "folders": "/" },
@@ -272,6 +274,68 @@ cat > "${AIROOTFS}/etc/xdg/fastfetch/config.jsonc" <<'FFCONFEOF'
 FFCONFEOF
 [[ -s "${AIROOTFS}/etc/xyloos/logo.txt" && -s "${AIROOTFS}/etc/xdg/fastfetch/config.jsonc" ]] \
   || die "Could not write the fastfetch logo files."
+
+# ---- 5c. Leftover Arch text: replace what can be replaced, cover the rest -----
+# Everything here is display-only. Real names (kernel release, package names,
+# archiso kernel parameters) are untouched, so nothing that depends on them breaks.
+c_green "==> Replacing leftover Arch text and adding the xyloOS display layers..."
+
+# (a) Login prompt. Arch's filesystem package would show "Arch Linux <kernel>"; it
+#     installs its own copy next to this one as /etc/issue.pacnew (ours wins).
+printf '%s\n\n' 'xyloOS Live (\l)' > "${AIROOTFS}/etc/issue"
+
+# (b) Build-time hook: delete that .pacnew and Arch's marker file once the image
+#     is assembled. releng's own cleanup hook removes this hook afterwards.
+mkdir -p "${AIROOTFS}/etc/pacman.d/hooks"
+cat > "${AIROOTFS}/etc/pacman.d/hooks/50-xyloos-cleanup.hook" <<'HOOKEOF'
+# remove from airootfs!
+# Build-time only (releng's own cleanup hook deletes every hook carrying the line
+# above once the image is built). Arch's filesystem package drops its own
+# /etc/issue next to the xyloOS one as /etc/issue.pacnew and adds an Arch marker
+# file; remove both so no leftover Arch text ends up in the live image.
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = filesystem
+
+[Action]
+Description = Removing leftover Arch files from the live image...
+When = PostTransaction
+Depends = coreutils
+Exec = /usr/bin/rm -f /etc/issue.pacnew /etc/arch-release
+HOOKEOF
+
+# (c) releng's Installation_guide script opens the Arch wiki; point it at xyloOS.
+cat > "${AIROOTFS}/usr/local/bin/Installation_guide" <<'GUIDEEOF'
+#!/bin/sh
+echo "To install xyloOS, run:  xylo-installer"
+GUIDEEOF
+
+# (d) Kernel name layer. The kernel's release string ("...-arch1-1") is built into
+#     the kernel and cannot be renamed, so when a person runs uname in a terminal
+#     it is shown as "...-xylo1-1". Scripts and pipes still get the real value.
+#     (fastfetch's Kernel line has the same layer in its config.)
+cat > "${AIROOTFS}/usr/local/bin/uname" <<'UNAMEEOF'
+#!/bin/bash
+# xyloOS display layer. When a person runs `uname` in a terminal, show the xyloOS
+# kernel name instead of Arch's. Scripts, pipes and redirects (stdout is not a
+# terminal) always get the real, unmodified value, so anything that looks up
+# /usr/lib/modules/$(uname -r) keeps working. The real value is always available
+# with:  /usr/bin/uname -r
+if [[ -t 1 ]]; then
+    /usr/bin/uname "$@" | sed -E 's/-arch([0-9]+)-([0-9]+)/-xylo\1-\2/g'
+    exit "${PIPESTATUS[0]}"
+fi
+exec /usr/bin/uname "$@"
+UNAMEEOF
+sed -i '/^file_permissions=(/a\  ["/usr/local/bin/uname"]="0:0:755"' "${PROFILE_DIR}/profiledef.sh"
+
+# (e) Menu text in boot files this USB layout never reads (PXE, GRUB loopback).
+for f in "${PROFILE_DIR}"/syslinux/archiso_pxe*.cfg "${PROFILE_DIR}"/grub/*.cfg; do
+  [[ -f "$f" ]] && sed -i 's/Arch Linux/xyloOS/g' "$f"
+done
 
 # ---- 6. Black dialog theme (replaces the default blue screen) --------------
 c_green "==> Installing black dialog theme..."
