@@ -523,6 +523,43 @@ for mod in reboot.c32 poweroff.c32 libutil.c32; do
     done
 done
 
+# ---- 10b. Nothing on the USB stick itself should say "arch" ------------------
+# What Windows shows for a flashed stick (Disk Management / File Explorer):
+#   - the small EFI partition's label, which mkarchiso hard-codes as ARCHISO_EFI
+#   - the BIOS menu file names in boot/syslinux/ (archiso_*.cfg)
+# The kernel parameter names (archisobasedir=, archisosearchuuid=) are read by
+# the initramfs, so they are deliberately left alone: renaming them would stop
+# the live system from finding its own files.
+c_green "==> Removing the remaining Arch names from the USB layout..."
+
+# (a) EFI partition label. The string appears exactly once in mkarchiso and
+#     nothing reads it back, so it is purely cosmetic and safe to rename. This
+#     edits the copy of mkarchiso inside the (throw-away) build container.
+MKARCHISO_BIN="$(command -v mkarchiso)"
+sed -i --follow-symlinks 's/ARCHISO_EFI/XYLOOS_EFI/g' "$MKARCHISO_BIN"
+if ! grep -q -- '-n XYLOOS_EFI' "$MKARCHISO_BIN"; then
+  c_red "WARNING: could not rename the EFI partition label; it will show as ARCHISO_EFI."
+fi
+
+# (b) BIOS menu files: archiso_*.cfg -> xyloos_*.cfg, plus every INCLUDE/CONFIG
+#     line that points at them. mkarchiso copies this folder file by file under
+#     the same names and nothing else refers to them, so a consistent rename is
+#     safe. The check at the end stops the build if any reference is left
+#     dangling, because that is exactly what breaks the BIOS menu.
+for f in "${SYSLINUX_DIR}"/archiso_*.cfg; do
+  [[ -f "$f" ]] || continue
+  mv -- "$f" "${SYSLINUX_DIR}/xyloos_${f##*/archiso_}"
+done
+sed -i -E 's/^((INCLUDE|CONFIG)[[:space:]]+)archiso_/\1xyloos_/' "${SYSLINUX_DIR}"/*.cfg
+if [[ -f "${SYSLINUX_DIR}/xyloos_pxe-linux.cfg" ]]; then
+  sed -i 's/^LABEL arch_/LABEL xyloos_/' "${SYSLINUX_DIR}/xyloos_pxe-linux.cfg"
+fi
+while read -r ref; do
+  [[ -f "${SYSLINUX_DIR}/${ref}" ]] || die "BIOS menu points at a missing file: ${ref}"
+done < <(grep -hE '^(INCLUDE|CONFIG)[[:space:]]' "${SYSLINUX_DIR}"/*.cfg | awk '{print $2}')
+[[ -f "${SYSLINUX_DIR}/xyloos_sys.cfg" && -f "${SYSLINUX_DIR}/xyloos_head.cfg" \
+   && -f "${SYSLINUX_DIR}/xyloos_sys-linux.cfg" ]] || die "BIOS menu files are missing after the rename."
+
 # ---- 11. Build the ISO ---------------------------------------------------------
 c_green "==> Running mkarchiso (this will take a while and needs internet)..."
 mkarchiso -v -w "${WORKDIR}/mkarchiso-work" -o "$OUT_DIR" "$PROFILE_DIR"
