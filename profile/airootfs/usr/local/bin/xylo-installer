@@ -2,6 +2,7 @@
 # xyloOS installation wizard -- drop-in repair of the existing installer.
 # Base revision: 889bb2bdcba93946fcc9670390708fb0f8dc32d9
 # r3: also installs the terminal-only uname display layer into the installed system.
+# r4: the internet check no longer depends on ping alone (virtual machine networks often drop it).
 # r2: the installer-drive check now runs FIRST (before the wizard) and prints a
 # read-only evidence report if the live medium cannot be identified. Disk
 # selection, partitioning and pacstrap logic are unchanged from r1.
@@ -14,7 +15,7 @@ export LC_ALL=C
 export TERM="${TERM:-linux}"
 [[ "$TERM" == dumb ]] && export TERM=linux
 
-INSTALLER_VERSION="2026.10.09-r3"
+INSTALLER_VERSION="2026.10.24-r4"
 BOLD=$'\033[1m'; RESET=$'\033[0m'
 CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; YELLOW=$'\033[1;33m'
 banner() { printf '\n%s=== %s ===%s\n' "$BOLD$CYAN" "$*" "$RESET" >&2; }
@@ -269,9 +270,20 @@ step_lang() {
     ok "Language set to $LANG_LABEL"
 }
 
+# Is the internet reachable? A web request is tried first because many virtual
+# machine networks (QEMU user-mode, some NAT setups) drop ping while passing web
+# traffic; ping stays as the fallback for networks that do the opposite.
+net_ok() {
+    if command -v curl &>/dev/null \
+       && curl -fsS -o /dev/null --max-time 6 https://ping.archlinux.org/nm-check.txt &>/dev/null; then
+        return 0
+    fi
+    ping -c1 -W3 archlinux.org &>/dev/null
+}
+
 step_wifi() {
     banner "STEP 2: Network Connectivity"
-    if ping -c1 -W2 archlinux.org &>/dev/null; then
+    if net_ok; then
         ok "Already online (wired connection or previously connected)."
         return 0
     fi
@@ -283,17 +295,20 @@ step_wifi() {
         info "Trying DHCP on $ethdev..."
         ip link set "$ethdev" up 2>/dev/null
         timeout 10 dhcpcd -1 "$ethdev" &>/dev/null || timeout 10 dhclient -1 "$ethdev" &>/dev/null
-        if ping -c1 -W2 archlinux.org &>/dev/null; then
-            ok "Connected via $ethdev."
-            return 0
-        fi
+        for _ in 1 2 3; do
+            if net_ok; then
+                ok "Connected via $ethdev."
+                return 0
+            fi
+            sleep 2
+        done
     fi
 
     if ! command -v iwctl &>/dev/null; then
         warn "iwd/iwctl not available. Connect a wired cable and press Enter,"
         warn "or open a second console (Ctrl+Alt+F2) and connect manually."
         read -rp "Press Enter once you have a network connection: " _
-        if ping -c1 -W2 archlinux.org &>/dev/null; then
+        if net_ok; then
             return 0
         fi
         warn "Still no internet access."
@@ -407,7 +422,7 @@ step_wifi() {
         fi
 
         sleep 1
-        if ping -c1 -W3 archlinux.org &>/dev/null; then
+        if net_ok; then
             ok "Connected to the internet."
             return 0
         else
@@ -1009,7 +1024,7 @@ CHROOT
     run_logged "Flushing filesystem writes" sync
     run_logged "Unmounting the installed system" umount -R /mnt
     MOUNTED_ROOT=0
-    ok "xyloOS installation complete. Remove the installer USB when rebooting."
+    ok "xyloOS installation complete. Remove the installer USB (in a VM: eject the virtual disc) before rebooting."
 }
 
 
@@ -1107,7 +1122,7 @@ BANNER
     fi
     step_install
     echo
-    if confirm "Installation finished. Remove the installer USB when the machine restarts.\n\nReboot now?"; then
+    if confirm "Installation finished. Remove the installer USB (in a VM: eject the virtual disc) before the machine restarts.\n\nReboot now?"; then
         reboot || die "Could not request a reboot. Reboot manually."
     fi
 }
