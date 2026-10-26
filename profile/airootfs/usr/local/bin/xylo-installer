@@ -3,6 +3,7 @@
 # Base revision: 889bb2bdcba93946fcc9670390708fb0f8dc32d9
 # r3: also installs the terminal-only uname display layer into the installed system.
 # r4: the internet check no longer depends on ping alone (virtual machine networks often drop it).
+# r5: explains the "installer starts again after install" situation (disc/USB still first boot device).
 # r2: the installer-drive check now runs FIRST (before the wizard) and prints a
 # read-only evidence report if the live medium cannot be identified. Disk
 # selection, partitioning and pacstrap logic are unchanged from r1.
@@ -15,7 +16,7 @@ export LC_ALL=C
 export TERM="${TERM:-linux}"
 [[ "$TERM" == dumb ]] && export TERM=linux
 
-INSTALLER_VERSION="2026.10.24-r4"
+INSTALLER_VERSION="2026.10.25-r5"
 BOLD=$'\033[1m'; RESET=$'\033[0m'
 CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; YELLOW=$'\033[1;33m'
 banner() { printf '\n%s=== %s ===%s\n' "$BOLD$CYAN" "$*" "$RESET" >&2; }
@@ -268,6 +269,57 @@ step_lang() {
         *) die "Invalid language selection." ;;
     esac
     ok "Language set to $LANG_LABEL"
+}
+
+# After a finished install the installer disc/USB is usually still the first boot
+# device, so the machine simply starts this wizard again. These two functions
+# recognise that situation and say what to do instead of silently restarting.
+# (The root partition this wizard creates is named xylo-root.)
+EXISTING_DISK=""
+find_existing_install() {
+    EXISTING_DISK=""
+    local name="" label="" disk=""
+    while read -r name label; do
+        [[ "$label" == "xylo-root" ]] || continue
+        disk=$(lsblk -dn -o PKNAME -- "$name" 2>/dev/null | head -n 1)
+        [[ -n "$disk" ]] || continue
+        disk="/dev/$disk"
+        [[ " ${BOOT_DISKS[*]:-} " == *" $disk "* ]] && continue   # never the installer medium itself
+        EXISTING_DISK="$disk"
+        return 0
+    done < <(lsblk -rn -p -o NAME,PARTLABEL 2>/dev/null)
+    return 1
+}
+
+existing_install_notice() {
+    local choice=""
+    choice=$(menu_pick "xyloOS is already installed" \
+"xyloOS is already installed on ${EXISTING_DISK}.\n\nYou are seeing this installer again because the installer disc or USB is still the first thing this computer starts from. The installed system is fine; it just has to be started instead.\n\nRemove the installer first:\n- USB stick: unplug it.\n- VirtualBox: Devices > Optical Drives > Remove disk from virtual drive (or Settings > System > Boot Order: put Hard Disk first).\n- VMware: VM > Settings > CD/DVD, untick Connected." \
+        22 76 2 \
+        poweroff  "Power off now, then remove the installer and start again" \
+        reinstall "Install xyloOS again (the wizard erases a disk)") || return 0
+    if [[ "$choice" == poweroff ]]; then
+        poweroff || die "Could not request a power off. Power off manually."
+        exit 0
+    fi
+    return 0
+}
+
+# The last screen. The installer must leave before the next start, otherwise the
+# machine boots the wizard again, so say so clearly and offer Power off first.
+finish_screen() {
+    local choice=""
+    choice=$(menu_pick "xyloOS is installed" \
+"xyloOS is now installed on ${TARGET_DISK}.\n\nBEFORE the next start, take the installer away, or this wizard will simply start again:\n- USB stick: unplug it when the screen goes dark.\n- VirtualBox: Devices > Optical Drives > Remove disk from virtual drive (or Settings > System > Boot Order: put Hard Disk first).\n- VMware: VM > Settings > CD/DVD, untick Connected.\n\nEasiest in a virtual machine: choose Power off, remove the disc, then start the VM again." \
+        24 76 3 \
+        poweroff "Power off (recommended in a virtual machine)" \
+        restart  "Restart now (only if the installer is already removed)" \
+        stay     "Stay in the installer") || choice="stay"
+    case "$choice" in
+        poweroff) poweroff || die "Could not request a power off. Power off manually." ;;
+        restart)  reboot   || die "Could not request a reboot. Reboot manually." ;;
+    esac
+    return 0
 }
 
 # Is the internet reachable? A web request is tried first because many virtual
@@ -1095,6 +1147,10 @@ BANNER
     info "Installer version: $INSTALLER_VERSION"
     info "Log: $LOG_FILE"
     sleep 1
+    CURRENT_STAGE="existing installation check"
+    if find_existing_install; then
+        existing_install_notice
+    fi
     CURRENT_STAGE="language selection"
     step_lang
     CURRENT_STAGE="network setup"
@@ -1122,9 +1178,7 @@ BANNER
     fi
     step_install
     echo
-    if confirm "Installation finished. Remove the installer USB (in a VM: eject the virtual disc) before the machine restarts.\n\nReboot now?"; then
-        reboot || die "Could not request a reboot. Reboot manually."
-    fi
+    finish_screen
 }
 
 # Sourceable for non-destructive function tests; no root/install side effects
