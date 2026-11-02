@@ -195,12 +195,40 @@ sort -u -o "${PROFILE_DIR}/packages.x86_64" "${PROFILE_DIR}/packages.x86_64"
 for stale_pkg in broadcom-wl; do
     sed -i "/^${stale_pkg}\$/d" "${PROFILE_DIR}/packages.x86_64"
 done
-c_red "NOTE: this package list was written from best available knowledge of"
-c_red "Arch's official repos, not verified live against a pacman database (no"
-c_red "Arch mirror access where this kit was authored). If mkarchiso below"
-c_red "fails with 'target not found' for any package, remove that line from"
-c_red "packages.x86_64 and check the current name at https://archlinux.org/packages/"
-c_red "— the installer itself also re-checks availability at install time."
+# ---- 4b. Drop packages that no longer exist in the Arch repositories ---------
+# Arch is a rolling release: packages get renamed or removed. That is how "dwm"
+# and "broadcom-wl" each failed an earlier build, and upstream itself dropped
+# "linux-atm" from its own list recently. Instead of failing the whole ISO for
+# one missing optional package, ask pacman (the same resolver mkarchiso uses)
+# which entries cannot be found and drop just those, loudly. The installer
+# re-checks every package against the real mirrors before it touches a disk, so
+# nothing goes missing silently at install time. If a package the live system
+# cannot work without is missing, the build still stops.
+c_green "==> Checking every package against the current Arch repositories..."
+PKGLIST_FILE="${PROFILE_DIR}/packages.x86_64"
+ESSENTIAL_PKGS=(base linux mkinitcpio-archiso syslinux dialog parted dosfstools
+                e2fsprogs arch-install-scripts grub efibootmgr networkmanager)
+pkgs_ok=0
+for _ in 1 2 3 4 5 6; do
+    mapfile -t pkg_names < <(grep -vE '^[[:space:]]*(#|$)' "$PKGLIST_FILE")
+    if pkg_err=$(pacman -Sp --noconfirm --print-format '%n' "${pkg_names[@]}" 2>&1 >/dev/null); then
+        pkgs_ok=1
+        break
+    fi
+    mapfile -t pkg_gone < <(grep -oE 'target not found: [^[:space:]]+' <<<"$pkg_err" | awk '{print $NF}' | sort -u)
+    (( ${#pkg_gone[@]} > 0 )) || die "pacman cannot resolve the live ISO package list: ${pkg_err}"
+    for missing in "${pkg_gone[@]}"; do
+        for essential in "${ESSENTIAL_PKGS[@]}"; do
+            if [[ "$missing" == "$essential" ]]; then
+                die "Essential package '${missing}' is not in the Arch repositories right now."
+            fi
+        done
+        c_red "WARNING: dropping '${missing}' from the live ISO (not in the current repositories)."
+        grep -vxF -- "$missing" "$PKGLIST_FILE" > "${PKGLIST_FILE}.tmp" || true
+        mv -- "${PKGLIST_FILE}.tmp" "$PKGLIST_FILE"
+    done
+done
+(( pkgs_ok == 1 )) || die "The live ISO package list still cannot be resolved after dropping missing packages."
 
 # ---- 5. Remaining airootfs branding (os-release, hostname) ------------------
 c_green "==> Rebranding os-release / hostname..."
